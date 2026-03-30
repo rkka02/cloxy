@@ -16,8 +16,8 @@ This project does not try to perfectly emulate every OpenAI endpoint. It focuses
 
 Current backend support:
 
-- `cloxy-claude`: recommended first backend, supports real streaming
-- `cloxy-codex`: experimental, streams as chunked final text because Codex CLI exposes JSONL events but not token deltas in the tested path
+- `cloxy-claude`: recommended first backend, supports real streaming and image input
+- `cloxy-codex`: experimental, streams as chunked final text because Codex CLI exposes JSONL events but not token deltas in the tested path; image input is supported
 
 ## Why This Shape
 
@@ -71,13 +71,32 @@ Optional environment variables:
 
 The proxy also accepts simple aliases such as `claude` and `codex`.
 
+Each model object also includes a `capabilities` block describing support for:
+
+- `text`
+- `imageInput`
+- `sessionPersistence`
+- `tools`
+- `streaming`
+
 ## Headers
 
 - `Authorization: Bearer <token>` if `CLOXY_API_KEY` is configured
 - `X-Cloxy-Working-Directory: /absolute/path` to override the working directory within the configured allowlist
 - Windows absolute paths such as `C:\work\repo` are supported too
+- `X-Cloxy-Session-Mode: persist` to opt into backend-native session persistence
+- `X-Cloxy-Session-Id: <uuid>` to resume a previously persisted Cloxy backend session
 
 Requests are stateless by default. That matches how most OpenAI-compatible clients use `chat.completions`: they resend the relevant message history on every request.
+
+When `X-Cloxy-Session-Mode: persist` is set, Cloxy returns the backend session ID in the `X-Cloxy-Session-Id` response header. It also includes the same value in the response body:
+
+- `chat.completions`: top-level `cloxy.session_id`
+- `responses`: `metadata.cloxy_session_id`
+
+Reuse that session ID on later requests with `X-Cloxy-Session-Id` to continue the same backend-native session.
+
+When you resume a session, do not resend the full earlier transcript unless you intentionally want duplicate context inside the backend session. Send only the new turn plus any fresh system guidance you want applied.
 
 ## Example
 
@@ -121,19 +140,96 @@ curl http://127.0.0.1:4141/v1/chat/completions \
   }'
 ```
 
+Image input with OpenAI-style `image_url` data URLs:
+
+```bash
+curl http://127.0.0.1:4141/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "cloxy-claude",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {"type": "text", "text": "What is in this image?"},
+          {
+            "type": "image_url",
+            "image_url": {
+              "url": "data:image/png;base64,...",
+              "detail": "low"
+            }
+          }
+        ]
+      }
+    ]
+  }'
+```
+
+Opt-in session persistence:
+
+```bash
+curl -i http://127.0.0.1:4141/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -H 'X-Cloxy-Session-Mode: persist' \
+  -d '{
+    "model": "cloxy-codex",
+    "messages": [
+      {"role": "user", "content": "Remember the word BANANA and reply only stored."}
+    ]
+  }'
+```
+
+Then reuse the returned `X-Cloxy-Session-Id`:
+
+```bash
+curl http://127.0.0.1:4141/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -H 'X-Cloxy-Session-Id: <uuid-from-previous-response>' \
+  -d '{
+    "model": "cloxy-codex",
+    "messages": [
+      {"role": "user", "content": "What word did I ask you to remember? Reply with one word."}
+    ]
+  }'
+```
+
+Responses API image input:
+
+```bash
+curl http://127.0.0.1:4141/v1/responses \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "cloxy-claude",
+    "input": [
+      {
+        "type": "message",
+        "role": "user",
+        "content": [
+          {"type": "input_text", "text": "What is in this image?"},
+          {"type": "input_image", "image_url": "data:image/png;base64,...", "detail": "low"}
+        ]
+      }
+    ]
+  }'
+```
+
 ## Limitations
 
 - `/v1/chat/completions` and `/v1/responses` are implemented in this MVP.
-- `/v1/responses` currently supports text input only.
-- Tool calling, embeddings, image inputs, and stored conversations are not implemented yet.
-- Cloxy does not persist backend sessions in the MVP.
+- `/v1/responses` currently supports text and image input only.
+- Tool calling and embeddings are not implemented yet.
+- Session persistence is opt-in and header-based rather than automatic OpenAI conversation storage.
 - Codex emits machine-readable events, but token-by-token output was not available in the tested command path, so streaming compatibility is coarse.
 - The "fixed cost" thesis only makes sense when the underlying CLI is authenticated in subscription-backed mode rather than API-key billing mode.
+- Only `data:image/jpeg;base64,...` and `data:image/png;base64,...` inputs are accepted right now.
+- Image inputs are limited to 10 MiB per image, 40 MiB total, and 16 images per request.
+- For streaming requests, `X-Cloxy-Session-Id` is always echoed when you resume an existing session. For brand-new persisted streaming sessions, use a non-streaming bootstrap request first if your client needs the session ID immediately.
 
 ## Windows Notes
 
 - Cloxy now launches `claude` and `codex` through the Windows command shell when they are installed as `.cmd` or `.bat` shims.
 - If you use custom binaries, prefer setting `CLOXY_CLAUDE_BIN` and `CLOXY_CODEX_BIN` to the exact command or executable you already run successfully in PowerShell.
+- Image smoke tests were verified on Windows by running a second Cloxy instance on a non-default port.
 
 ## Architecture
 

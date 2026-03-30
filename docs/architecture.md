@@ -14,9 +14,10 @@ MVP request translation deliberately stays simple:
 
 - support `system`, `user`, `assistant`, and `tool` roles
 - support message content as plain strings
-- support text-only content arrays
+- support content arrays with text and image parts
 - support `responses.instructions` as an injected system message
-- reject image or binary parts for now
+- accept `data:image/jpeg;base64,...` and `data:image/png;base64,...`
+- reject remote URLs and non-image binary inputs for now
 
 Prompt rendering follows this shape:
 
@@ -28,15 +29,25 @@ This keeps behavior predictable across both backends.
 
 ## Stateless By Default
 
-The MVP intentionally does not persist backend-native session IDs.
+Cloxy defaults to stateless request transport.
 
 Why:
 
 - most OpenAI-compatible clients already resend relevant history on every request
 - stateless requests are easier to reason about and debug
-- keeping backend sessions around creates cleanup and divergence problems
+- backend-native session reuse creates cleanup and divergence problems if it becomes implicit
 
-If session reuse ever comes back, it should be opt-in and explicit rather than the default transport model.
+The default backend launches are therefore ephemeral:
+
+- Claude runs with SDK `persistSession: false`
+- Codex runs with `codex exec --ephemeral`
+
+Session reuse is available as an explicit opt-in transport mode instead:
+
+- `X-Cloxy-Session-Mode: persist` creates a backend-native session and returns its ID in `X-Cloxy-Session-Id`
+- `X-Cloxy-Session-Id: <uuid>` resumes that backend-native session on later requests
+
+When resuming a persisted session, clients should send only the new turn they want appended. Resending the entire older transcript will duplicate context inside the backend session.
 
 ## Working Directory Control
 
@@ -48,13 +59,19 @@ Because the backend CLIs can access the local filesystem, each request runs insi
 
 This prevents the proxy from becoming an unrestricted local shell bridge by accident.
 
+Image inputs are also guarded before backend handoff:
+
+- maximum 10 MiB per image
+- maximum 40 MiB total image payload per request
+- maximum 16 images per request
+
 ## Backend Notes
 
 ### Claude
 
-- command path uses `claude -p`
-- JSON mode is used for non-streaming
-- `stream-json` mode is used for SSE
+- command path uses the Claude Agent SDK against the local Claude Code install
+- multimodal requests are sent through SDK streaming input mode so image blocks survive translation
+- stateless requests disable transcript persistence; persisted sessions use SDK resume mode
 - tools are disabled by default to avoid nested-agent surprises
 - on Windows, shim-style commands are launched through the shell so `.cmd` installs work
 
@@ -62,6 +79,8 @@ This prevents the proxy from becoming an unrestricted local shell bridge by acci
 
 - command path uses `codex exec --json`
 - sandbox defaults to `read-only`
+- stateless requests use `--ephemeral`; persisted sessions use `codex exec resume`
+- data URL images are materialized to temporary files and attached via `--image`
 - JSONL events are translated into a final assistant chunk for stream requests
 - on Windows, shim-style commands are launched through the shell so `.cmd` installs work
 
@@ -70,5 +89,4 @@ This prevents the proxy from becoming an unrestricted local shell bridge by acci
 - full OpenAI `/v1/responses` parity
 - assistant tool calling passthrough
 - embeddings
-- multimodal inputs
 - automatic workspace checkout or worktree management

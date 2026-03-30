@@ -1,5 +1,9 @@
 import type { ChildProcess } from "node:child_process";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import type { CloxyConfig } from "../config";
+import { renderTranscript } from "../openai";
 import type {
   BackendAdapter,
   CompletionParams,
@@ -10,10 +14,18 @@ import { spawnCli } from "./process";
 
 interface CodexParsedOutput {
   text?: string;
+  sessionId?: string;
 }
 
 export class CodexAdapter implements BackendAdapter {
   readonly backend = "codex" as const;
+  readonly capabilities = {
+    text: true,
+    imageInput: true,
+    sessionPersistence: true,
+    tools: false,
+    streaming: true
+  } as const;
 
   constructor(private readonly config: CloxyConfig) {}
 
@@ -25,12 +37,20 @@ export class CodexAdapter implements BackendAdapter {
 
     return {
       backend: this.backend,
-      text: output.text.trim()
+      text: output.text.trim(),
+      sessionId: output.sessionId
     };
   }
 
   async *stream(params: CompletionParams): AsyncGenerator<StreamEvent> {
     const output = await runCodexProcess(this.config, params);
+
+    if (output.sessionId) {
+      yield {
+        type: "session",
+        sessionId: output.sessionId
+      };
+    }
 
     if (output.text) {
       yield {
@@ -49,14 +69,27 @@ async function runCodexProcess(
   config: CloxyConfig,
   params: CompletionParams
 ): Promise<CodexParsedOutput> {
-  const args = [
-    "exec",
-    "--skip-git-repo-check",
-    "--json",
-    "--sandbox",
-    config.codexSandbox,
-    "-"
-  ];
+  const imageTempDir = await createImageTempDir(params);
+  const args = params.sessionId
+    ? [
+        "exec",
+        "resume",
+        "--json",
+        "--skip-git-repo-check",
+        ...imageTempDir.args,
+        params.sessionId,
+        "-"
+      ]
+    : [
+        "exec",
+        "--skip-git-repo-check",
+        "--json",
+        "--sandbox",
+        config.codexSandbox,
+        ...(params.persistSession ? [] : ["--ephemeral"]),
+        ...imageTempDir.args,
+        "-"
+      ];
 
   const child = spawnCli(config.codexBinary, args, {
     cwd: params.cwd,
@@ -65,22 +98,60 @@ async function runCodexProcess(
 
   let stdout = "";
   let stderr = "";
-  child.stdin!.end(params.prompt);
-  child.stdout!.setEncoding("utf8");
-  child.stderr!.setEncoding("utf8");
-  child.stdout!.on("data", (chunk) => {
-    stdout += chunk;
-  });
-  child.stderr!.on("data", (chunk) => {
-    stderr += chunk;
-  });
 
-  const exitCode = await waitForExit(child);
-  if (exitCode !== 0) {
-    throw new Error(`Codex exited with code ${exitCode}: ${stderr.trim()}`);
+  try {
+    child.stdin!.end(
+      renderTranscript(params.messages, {
+        includeImagePlaceholders: true
+      })
+    );
+    child.stdout!.setEncoding("utf8");
+    child.stderr!.setEncoding("utf8");
+    child.stdout!.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr!.on("data", (chunk) => {
+      stderr += chunk;
+    });
+
+    const exitCode = await waitForExit(child);
+    if (exitCode !== 0) {
+      throw new Error(`Codex exited with code ${exitCode}: ${stderr.trim()}`);
+    }
+
+    return parseCodexJsonl(stdout);
+  } finally {
+    if (imageTempDir.path) {
+      await rm(imageTempDir.path, { recursive: true, force: true });
+    }
+  }
+}
+
+async function createImageTempDir(
+  params: CompletionParams
+): Promise<{ path?: string; args: string[] }> {
+  const imageParts = params.messages.flatMap((message) =>
+    message.content.filter((part) => part.type === "image")
+  );
+
+  if (imageParts.length === 0) {
+    return { args: [] };
   }
 
-  return parseCodexJsonl(stdout);
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "cloxy-codex-"));
+  const args: string[] = [];
+
+  for (const [index, image] of imageParts.entries()) {
+    const extension = image.mediaType === "image/png" ? ".png" : ".jpg";
+    const filePath = path.join(tempDir, `image-${index + 1}${extension}`);
+    await writeFile(filePath, Buffer.from(image.data, "base64"));
+    args.push("--image", filePath);
+  }
+
+  return {
+    path: tempDir,
+    args
+  };
 }
 
 function parseCodexJsonl(stdout: string): CodexParsedOutput {
@@ -90,9 +161,15 @@ function parseCodexJsonl(stdout: string): CodexParsedOutput {
     .filter(Boolean);
 
   let text: string | undefined;
+  let sessionId: string | undefined;
 
   for (const line of lines) {
     const parsed = JSON.parse(line) as Record<string, unknown>;
+
+    if (parsed.type === "thread.started" && typeof parsed.thread_id === "string") {
+      sessionId = parsed.thread_id;
+      continue;
+    }
 
     if (parsed.type === "item.completed") {
       const item = parsed.item as Record<string, unknown> | undefined;
@@ -102,7 +179,7 @@ function parseCodexJsonl(stdout: string): CodexParsedOutput {
     }
   }
 
-  return { text };
+  return { text, sessionId };
 }
 
 function waitForExit(child: ChildProcess): Promise<number | null> {

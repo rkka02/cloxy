@@ -1,31 +1,49 @@
-import type { ChildProcess } from "node:child_process";
+import {
+  query,
+  type PermissionMode,
+  type SDKMessage,
+  type SDKUserMessage
+} from "@anthropic-ai/claude-agent-sdk";
+import type { ContentBlockParam } from "@anthropic-ai/sdk/resources/messages";
 import type { CloxyConfig } from "../config";
+import { CloxyHttpError } from "../errors";
+import type { ConversationMessage, MessageContentPart } from "../openai";
 import type {
   BackendAdapter,
   CompletionParams,
   CompletionResult,
   StreamEvent
 } from "./types";
-import { spawnCli } from "./process";
-
-interface ClaudeJsonResult {
-  result?: string;
-}
 
 export class ClaudeAdapter implements BackendAdapter {
   readonly backend = "claude" as const;
+  readonly capabilities = {
+    text: true,
+    imageInput: true,
+    sessionPersistence: true,
+    tools: false,
+    streaming: true
+  } as const;
 
   constructor(private readonly config: CloxyConfig) {}
 
   async complete(params: CompletionParams): Promise<CompletionResult> {
-    const args = this.buildCommonArgs(["--output-format=json"]);
-    const stdout = await runProcess({
-      command: this.config.claudeBinary,
-      args: [...args, "--", params.prompt],
-      cwd: params.cwd
-    });
-    const parsed = JSON.parse(stdout.trim()) as ClaudeJsonResult;
-    const text = (parsed.result ?? "").trim();
+    let text = "";
+    let sessionId = params.sessionId;
+
+    for await (const message of runClaudeQuery(this.config, params, false)) {
+      sessionId ??= getClaudeSessionId(message);
+
+      if (message.type !== "result") {
+        continue;
+      }
+
+      if (message.subtype !== "success" || message.is_error) {
+        throw toClaudeFailureError(message);
+      }
+
+      text = message.result.trim();
+    }
 
     if (!text) {
       throw new Error("Claude returned an empty result.");
@@ -33,115 +51,273 @@ export class ClaudeAdapter implements BackendAdapter {
 
     return {
       backend: this.backend,
-      text
+      text,
+      sessionId
     };
   }
 
   async *stream(params: CompletionParams): AsyncGenerator<StreamEvent> {
-    const args = this.buildCommonArgs([
-      "--verbose",
-      "--output-format=stream-json",
-      "--include-partial-messages"
-    ]);
-    const child = spawnCli(this.config.claudeBinary, [...args, "--", params.prompt], {
-      cwd: params.cwd,
-      stdio: ["ignore", "pipe", "pipe"]
-    });
+    let emittedDone = false;
+    let emittedSession = false;
 
-    let stderr = "";
-    child.stderr!.setEncoding("utf8");
-    child.stderr!.on("data", (chunk) => {
-      stderr += chunk;
-    });
+    for await (const message of runClaudeQuery(this.config, params, true)) {
+      const sessionId = getClaudeSessionId(message);
+      if (!emittedSession && sessionId) {
+        emittedSession = true;
+        yield { type: "session", sessionId };
+      }
 
-    let buffer = "";
-    child.stdout!.setEncoding("utf8");
+      if (message.type === "stream_event") {
+        const text = extractClaudeTextDelta(message);
+        if (text) {
+          yield { type: "delta", text };
+        }
+        continue;
+      }
 
-    for await (const chunk of child.stdout!) {
-      buffer += chunk;
-
-      while (true) {
-        const newlineIndex = buffer.indexOf("\n");
-        if (newlineIndex === -1) {
-          break;
+      if (message.type === "result") {
+        if (message.subtype !== "success" || message.is_error) {
+          throw toClaudeFailureError(message);
         }
 
-        const line = buffer.slice(0, newlineIndex).trim();
-        buffer = buffer.slice(newlineIndex + 1);
-
-        if (!line) {
-          continue;
-        }
-
-        const event = JSON.parse(line) as Record<string, unknown>;
-        const type = event.type;
-
-        if (type === "stream_event") {
-          const payload = event.event as Record<string, unknown> | undefined;
-          const delta = payload?.delta as Record<string, unknown> | undefined;
-          const text = delta?.text as string | undefined;
-          if (typeof text === "string" && text.length > 0) {
-            yield { type: "delta", text };
-          }
-          continue;
-        }
-
-        if (type === "result") {
-          yield { type: "done" };
-        }
+        emittedDone = true;
+        yield { type: "done" };
       }
     }
 
-    const exitCode = await waitForExit(child);
-    if (exitCode !== 0) {
-      throw new Error(`Claude exited with code ${exitCode}: ${stderr.trim()}`);
+    if (!emittedDone) {
+      yield { type: "done" };
+    }
+  }
+}
+
+async function* runClaudeQuery(
+  config: CloxyConfig,
+  params: CompletionParams,
+  includePartialMessages: boolean
+): AsyncGenerator<SDKMessage> {
+  const session = query({
+    prompt: createClaudeInput(params.messages),
+    options: {
+      cwd: params.cwd,
+      includePartialMessages,
+      maxTurns: 1,
+      pathToClaudeCodeExecutable: config.claudeBinary,
+      permissionMode: config.claudePermissionMode as PermissionMode,
+      persistSession: params.persistSession,
+      resume: params.sessionId,
+      systemPrompt: buildClaudeSystemPrompt(params.messages),
+      tools: []
+    }
+  });
+
+  try {
+    for await (const message of session) {
+      yield message;
+    }
+  } catch (error) {
+    throw normalizeClaudeError(error);
+  } finally {
+    session.close();
+  }
+}
+
+async function* createClaudeInput(
+  messages: ConversationMessage[]
+): AsyncGenerator<SDKUserMessage> {
+  yield {
+    type: "user",
+    parent_tool_use_id: null,
+    message: {
+      role: "user",
+      content: buildClaudeUserContent(messages)
+    }
+  };
+}
+
+function buildClaudeSystemPrompt(messages: ConversationMessage[]): string {
+  const systemMessages = messages
+    .filter((message) => message.role === "system")
+    .map((message) =>
+      message.content
+        .filter((part) => part.type === "text")
+        .map((part) => part.text)
+        .join("\n")
+        .trim()
+    )
+    .filter(Boolean);
+
+  return [
+    "You are a helpful AI assistant.",
+    "Continue the conversation naturally as the assistant.",
+    "Return only the assistant's next message.",
+    systemMessages.length > 0
+      ? `SYSTEM INSTRUCTIONS:\n${systemMessages.join("\n\n")}`
+      : ""
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+function buildClaudeUserContent(messages: ConversationMessage[]): ContentBlockParam[] {
+  const blocks: ContentBlockParam[] = [];
+  let textBuffer = "";
+
+  const appendText = (text: string) => {
+    textBuffer += text;
+  };
+
+  const flushText = () => {
+    if (!textBuffer) {
+      return;
+    }
+
+    blocks.push({
+      type: "text",
+      text: textBuffer
+    });
+    textBuffer = "";
+  };
+
+  appendText("CONVERSATION:\n");
+
+  const conversationMessages = messages.filter((message) => message.role !== "system");
+  if (conversationMessages.length === 0) {
+    appendText("USER:\nReply to the system instructions.");
+  }
+
+  conversationMessages.forEach((message, messageIndex) => {
+    if (messageIndex > 0) {
+      appendText("\n\n");
+    }
+
+    const label = message.name ? `${message.role}:${message.name}` : message.role;
+    appendText(`${label.toUpperCase()}:\n`);
+
+    message.content.forEach((part, partIndex) => {
+      appendClaudePart(part, appendText, flushText, blocks);
+
+      if (partIndex < message.content.length - 1) {
+        appendText("\n");
+      }
+    });
+  });
+
+  appendText("\n\nASSISTANT:");
+  flushText();
+  return blocks;
+}
+
+function appendClaudePart(
+  part: MessageContentPart,
+  appendText: (text: string) => void,
+  flushText: () => void,
+  blocks: ContentBlockParam[]
+): void {
+  if (part.type === "text") {
+    appendText(part.text);
+    return;
+  }
+
+  flushText();
+  blocks.push({
+    type: "image",
+    source: {
+      type: "base64",
+      media_type: part.mediaType,
+      data: part.data
+    }
+  });
+}
+
+function getClaudeSessionId(message: SDKMessage): string | undefined {
+  return "session_id" in message && typeof message.session_id === "string"
+    ? message.session_id
+    : undefined;
+}
+
+function extractClaudeTextDelta(message: SDKMessage): string | undefined {
+  if (message.type !== "stream_event") {
+    return undefined;
+  }
+
+  const event = message.event as unknown as Record<string, unknown>;
+  if (event.type !== "content_block_delta") {
+    return undefined;
+  }
+
+  const delta = event.delta as Record<string, unknown> | undefined;
+  if (delta?.type !== "text_delta" || typeof delta.text !== "string") {
+    return undefined;
+  }
+
+  return delta.text;
+}
+
+function toClaudeFailureError(message: Extract<SDKMessage, { type: "result" }>): Error {
+  if ("result" in message && typeof message.result === "string" && message.result.trim()) {
+    return normalizeClaudeError(new Error(message.result.trim()));
+  }
+
+  return new Error(`Claude exited with ${message.subtype}.`);
+}
+
+function normalizeClaudeError(error: unknown): Error {
+  if (!(error instanceof Error)) {
+    return new Error("Unknown Claude error.");
+  }
+
+  const parsed = parseClaudeApiError(error.message);
+  if (!parsed) {
+    return error;
+  }
+
+  return new CloxyHttpError(parsed.message, parsed.statusCode, parsed.type);
+}
+
+function parseClaudeApiError(message: string): {
+  message: string;
+  statusCode: number;
+  type: string;
+} | null {
+  const apiIndex = message.indexOf("API Error:");
+  if (apiIndex === -1) {
+    return null;
+  }
+
+  const apiSlice = message.slice(apiIndex);
+  const statusMatch = /API Error:\s*(\d+)/.exec(apiSlice);
+  if (!statusMatch) {
+    return null;
+  }
+
+  const statusCode = Number(statusMatch[1]);
+  let parsedMessage = message;
+  let type = statusCode >= 500 ? "server_error" : "invalid_request_error";
+  const jsonStart = apiSlice.indexOf("{");
+
+  if (jsonStart !== -1) {
+    try {
+      const body = JSON.parse(apiSlice.slice(jsonStart)) as {
+        error?: {
+          message?: string;
+          type?: string;
+        };
+      };
+      if (body.error?.message) {
+        parsedMessage = body.error.message;
+      }
+      if (body.error?.type) {
+        type = body.error.type;
+      }
+    } catch {
+      // Leave the original message if Claude returned a non-JSON API error body.
     }
   }
 
-  private buildCommonArgs(extraArgs: string[]): string[] {
-    return [
-      "-p",
-      "--permission-mode",
-      this.config.claudePermissionMode,
-      "--tools",
-      "",
-      ...extraArgs
-    ];
-  }
-}
-
-async function runProcess(input: {
-  command: string;
-  args: string[];
-  cwd: string;
-}): Promise<string> {
-  const child = spawnCli(input.command, input.args, {
-    cwd: input.cwd,
-    stdio: ["ignore", "pipe", "pipe"]
-  });
-
-  let stdout = "";
-  let stderr = "";
-  child.stdout!.setEncoding("utf8");
-  child.stderr!.setEncoding("utf8");
-  child.stdout!.on("data", (chunk) => {
-    stdout += chunk;
-  });
-  child.stderr!.on("data", (chunk) => {
-    stderr += chunk;
-  });
-
-  const exitCode = await waitForExit(child);
-  if (exitCode !== 0) {
-    throw new Error(`Claude exited with code ${exitCode}: ${stderr.trim()}`);
-  }
-
-  return stdout;
-}
-
-function waitForExit(child: ChildProcess): Promise<number | null> {
-  return new Promise((resolve, reject) => {
-    child.once("error", reject);
-    child.once("exit", (code) => resolve(code));
-  });
+  return {
+    message: parsedMessage,
+    statusCode,
+    type
+  };
 }
