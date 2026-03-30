@@ -6,6 +6,7 @@ The first MVP goal is narrow on purpose:
 
 - expose `/v1/models`
 - expose `/v1/chat/completions`
+- expose `/v1/responses`
 - support `stream: true`
 - map OpenAI-style requests to local CLI calls
 
@@ -86,6 +87,18 @@ curl http://127.0.0.1:4141/v1/chat/completions \
   }'
 ```
 
+Responses API:
+
+```bash
+curl http://127.0.0.1:4141/v1/responses \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "cloxy-claude",
+    "instructions": "Answer concisely.",
+    "input": "Say hello in Korean."
+  }'
+```
+
 Streaming:
 
 ```bash
@@ -102,8 +115,9 @@ curl http://127.0.0.1:4141/v1/chat/completions \
 
 ## Limitations
 
-- Only `/v1/chat/completions` is implemented in this MVP.
-- Tool calling, embeddings, image inputs, and `/v1/responses` are not implemented yet.
+- `/v1/chat/completions` and `/v1/responses` are implemented in this MVP.
+- `/v1/responses` currently supports text input only.
+- Tool calling, embeddings, image inputs, and stored conversations are not implemented yet.
 - Cloxy does not persist backend sessions in the MVP.
 - Codex emits machine-readable events, but token-by-token output was not available in the tested command path, so streaming compatibility is coarse.
 - The "fixed cost" thesis only makes sense when the underlying CLI is authenticated in subscription-backed mode rather than API-key billing mode.

@@ -21,6 +21,13 @@ export interface ChatCompletionRequestBody {
   user?: string;
 }
 
+export interface ResponseInputItem {
+  type?: string;
+  role?: string;
+  content?: unknown;
+  text?: string;
+ }
+
 export interface OpenAIModelObject {
   id: string;
   object: "model";
@@ -34,6 +41,14 @@ export function nowSeconds(): number {
 
 export function createCompletionId(): string {
   return `chatcmpl-${randomUUID()}`;
+}
+
+export function createResponseId(): string {
+  return `resp_${randomUUID().replace(/-/g, "")}`;
+}
+
+export function createMessageId(): string {
+  return `msg_${randomUUID().replace(/-/g, "")}`;
 }
 
 export function extractTextContent(content: string | ChatMessagePart[]): string {
@@ -50,6 +65,48 @@ export function extractTextContent(content: string | ChatMessagePart[]): string 
   });
 
   return textParts.join("\n");
+}
+
+export function normalizeResponsesInput(input: string | ResponseInputItem[]): ChatMessage[] {
+  if (typeof input === "string") {
+    return [{ role: "user", content: input }];
+  }
+
+  const messages: ChatMessage[] = [];
+
+  for (const item of input) {
+    if (typeof item !== "object" || item === null) {
+      throw new Error("Unsupported responses input item.");
+    }
+
+    if (item.type === "input_text" && typeof item.text === "string") {
+      messages.push({
+        role: "user",
+        content: item.text
+      });
+      continue;
+    }
+
+    if (typeof item.role === "string" && item.content !== undefined) {
+      messages.push({
+        role: normalizeResponseRole(item.role),
+        content: normalizeResponseContent(item.content)
+      });
+      continue;
+    }
+
+    if (item.type === "message" && typeof item.role === "string") {
+      messages.push({
+        role: normalizeResponseRole(item.role),
+        content: normalizeResponseContent(item.content)
+      });
+      continue;
+    }
+
+    throw new Error("Unsupported responses input item.");
+  }
+
+  return messages;
 }
 
 export function renderTranscript(messages: ChatMessage[]): string {
@@ -79,6 +136,17 @@ export function renderTranscript(messages: ChatMessage[]): string {
   ]
     .filter(Boolean)
     .join("\n");
+}
+
+export function prependInstructions(
+  messages: ChatMessage[],
+  instructions?: string
+): ChatMessage[] {
+  if (!instructions?.trim()) {
+    return messages;
+  }
+
+  return [{ role: "system", content: instructions.trim() }, ...messages];
 }
 
 export function toModelAlias(input: string): string {
@@ -126,4 +194,152 @@ export function formatChatStreamChunk(
       }
     ]
   };
+}
+
+export function formatResponseObject(
+  requestModel: string,
+  text: string,
+  instructions?: string
+): Record<string, unknown> {
+  return buildResponseObject({
+    id: createResponseId(),
+    messageId: createMessageId(),
+    requestModel,
+    text,
+    instructions,
+    status: "completed"
+  });
+}
+
+export function formatResponseCreated(
+  id: string,
+  requestModel: string,
+  instructions?: string
+): Record<string, unknown> {
+  return buildResponseObject({
+    id,
+    messageId: createMessageId(),
+    requestModel,
+    text: "",
+    instructions,
+    status: "in_progress"
+  });
+}
+
+export function formatResponseCompleted(
+  id: string,
+  messageId: string,
+  requestModel: string,
+  text: string,
+  instructions?: string
+): Record<string, unknown> {
+  return buildResponseObject({
+    id,
+    messageId,
+    requestModel,
+    text,
+    instructions,
+    status: "completed"
+  });
+}
+
+function buildResponseObject(input: {
+  id: string;
+  messageId: string;
+  requestModel: string;
+  text: string;
+  instructions?: string;
+  status: "in_progress" | "completed";
+}): Record<string, unknown> {
+  const output =
+    input.status === "completed"
+      ? [
+          {
+            id: input.messageId,
+            type: "message",
+            status: "completed",
+            role: "assistant",
+            content: [
+              {
+                type: "output_text",
+                text: input.text,
+                annotations: []
+              }
+            ]
+          }
+        ]
+      : [];
+
+  return {
+    id: input.id,
+    object: "response",
+    created_at: nowSeconds(),
+    status: input.status,
+    error: null,
+    incomplete_details: null,
+    instructions: input.instructions ?? null,
+    model: input.requestModel,
+    output,
+    parallel_tool_calls: false,
+    tool_choice: "none",
+    tools: [],
+    max_output_tokens: null,
+    previous_response_id: null,
+    reasoning: {
+      effort: null,
+      summary: null
+    },
+    store: false,
+    temperature: null,
+    text: {
+      format: {
+        type: "text"
+      }
+    },
+    usage: null,
+    metadata: {}
+  };
+}
+
+function normalizeResponseRole(role: string): ChatRole {
+  if (role === "developer") {
+    return "system";
+  }
+
+  if (role === "system" || role === "user" || role === "assistant" || role === "tool") {
+    return role;
+  }
+
+  throw new Error(`Unsupported responses role: ${role}`);
+}
+
+function normalizeResponseContent(content: unknown): string | ChatMessagePart[] {
+  if (typeof content === "string") {
+    return content;
+  }
+
+  if (!Array.isArray(content)) {
+    throw new Error("Unsupported responses content.");
+  }
+
+  return content.map((part) => {
+    if (typeof part !== "object" || part === null) {
+      throw new Error("Unsupported responses content part.");
+    }
+
+    const type = "type" in part ? part.type : undefined;
+    const text = "text" in part ? part.text : undefined;
+
+    if (
+      (type === "text" || type === "input_text" || type === "output_text") &&
+      typeof text === "string"
+    ) {
+      return {
+        type: "text",
+        text
+      };
+    }
+
+    throw new Error(`Unsupported responses content part type: ${String(type)}`);
+  });
 }

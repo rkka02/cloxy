@@ -2,7 +2,7 @@
 
 ## Core Flow
 
-1. An OpenAI-compatible client sends a `chat.completions` request.
+1. An OpenAI-compatible client sends a `chat.completions` or `responses` request.
 2. Cloxy resolves the backend from the requested model name.
 3. The request message array is flattened into a deterministic prompt transcript.
 4. Cloxy launches the chosen local CLI in non-interactive mode.
@@ -15,6 +15,7 @@ MVP request translation deliberately stays simple:
 - support `system`, `user`, `assistant`, and `tool` roles
 - support message content as plain strings
 - support text-only content arrays
+- support `responses.instructions` as an injected system message
 - reject image or binary parts for now
 
 Prompt rendering follows this shape:

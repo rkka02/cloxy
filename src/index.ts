@@ -10,10 +10,17 @@ import {
   type CloxyConfig
 } from "./config";
 import {
+  createMessageId,
   createCompletionId,
+  createResponseId,
   formatChatCompletion,
+  formatResponseCompleted,
+  formatResponseCreated,
+  formatResponseObject,
   formatChatStreamChunk,
+  normalizeResponsesInput,
   nowSeconds,
+  prependInstructions,
   renderTranscript,
   toModelAlias
 } from "./openai";
@@ -37,6 +44,20 @@ const chatCompletionSchema = z.object({
   messages: z.array(messageSchema).min(1),
   stream: z.boolean().optional(),
   user: z.string().optional()
+});
+
+const responsesInputItemSchema = z.object({
+  type: z.string().optional(),
+  role: z.string().optional(),
+  content: z.unknown().optional(),
+  text: z.string().optional()
+});
+
+const responsesSchema = z.object({
+  model: z.string(),
+  input: z.union([z.string(), z.array(responsesInputItemSchema)]),
+  instructions: z.string().optional(),
+  stream: z.boolean().optional()
 });
 
 const config = loadConfig();
@@ -155,6 +176,110 @@ server.post("/v1/chat/completions", async (request, reply) => {
 
   reply.code(200);
   return formatChatCompletion(body.model, result.text);
+});
+
+server.post("/v1/responses", async (request, reply) => {
+  const body = responsesSchema.parse(request.body);
+  const backend = resolveBackend(body.model, config.defaultBackend);
+  const adapter = adapters[backend];
+  const workingDirectory = resolveWorkingDirectory(
+    getHeaderValue(request.headers["x-cloxy-working-directory"]),
+    config.allowedRoots
+  );
+  const messages = prependInstructions(
+    normalizeResponsesInput(body.input),
+    body.instructions
+  );
+  const prompt = renderTranscript(messages);
+
+  if (body.stream) {
+    const responseId = createResponseId();
+    const messageId = createMessageId();
+    let fullText = "";
+
+    reply.hijack();
+    reply.raw.writeHead(200, {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive"
+    });
+    reply.raw.write(
+      encodeSse({
+        type: "response.created",
+        response: formatResponseCreated(responseId, body.model, body.instructions)
+      })
+    );
+
+    try {
+      for await (const event of adapter.stream({
+        prompt,
+        cwd: workingDirectory
+      })) {
+        if (event.type === "delta" && event.text) {
+          fullText += event.text;
+          reply.raw.write(
+            encodeSse({
+              type: "response.output_text.delta",
+              response_id: responseId,
+              item_id: messageId,
+              output_index: 0,
+              content_index: 0,
+              delta: event.text
+            })
+          );
+        }
+
+        if (event.type === "done") {
+          reply.raw.write(
+            encodeSse({
+              type: "response.output_text.done",
+              response_id: responseId,
+              item_id: messageId,
+              output_index: 0,
+              content_index: 0,
+              text: fullText
+            })
+          );
+          reply.raw.write(
+            encodeSse({
+              type: "response.completed",
+              response: formatResponseCompleted(
+                responseId,
+                messageId,
+                body.model,
+                fullText,
+                body.instructions
+              )
+            })
+          );
+          reply.raw.write("data: [DONE]\n\n");
+        }
+      }
+    } catch (error) {
+      reply.raw.write(
+        encodeSse({
+          type: "error",
+          error: {
+            message: toErrorMessage(error),
+            type: "server_error"
+          }
+        })
+      );
+      reply.raw.write("data: [DONE]\n\n");
+    } finally {
+      reply.raw.end();
+    }
+
+    return reply;
+  }
+
+  const result = await adapter.complete({
+    prompt,
+    cwd: workingDirectory
+  });
+
+  reply.code(200);
+  return formatResponseObject(body.model, result.text, body.instructions);
 });
 
 async function main(): Promise<void> {
