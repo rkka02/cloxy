@@ -1,4 +1,4 @@
-import type { ChildProcess } from "node:child_process";
+import { execFile, type ChildProcess } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -114,7 +114,7 @@ async function runCodexProcess(
       stderr += chunk;
     });
 
-    const exitCode = await waitForExit(child);
+    const exitCode = await waitForExit(child, config.codexTimeoutMs);
     if (exitCode !== 0) {
       throw new Error(`Codex exited with code ${exitCode}: ${stderr.trim()}`);
     }
@@ -182,9 +182,48 @@ function parseCodexJsonl(stdout: string): CodexParsedOutput {
   return { text, sessionId };
 }
 
-function waitForExit(child: ChildProcess): Promise<number | null> {
+function waitForExit(
+  child: ChildProcess,
+  timeoutMs: number
+): Promise<number | null> {
   return new Promise((resolve, reject) => {
-    child.once("error", reject);
-    child.once("exit", (code) => resolve(code));
+    const timer = setTimeout(() => {
+      void terminateProcessTree(child);
+      reject(new Error(`Codex process timed out after ${timeoutMs}ms.`));
+    }, timeoutMs);
+
+    const cleanup = () => {
+      clearTimeout(timer);
+      child.removeListener("error", onError);
+      child.removeListener("exit", onExit);
+    };
+
+    const onError = (error: Error) => {
+      cleanup();
+      reject(error);
+    };
+
+    const onExit = (code: number | null) => {
+      cleanup();
+      resolve(code);
+    };
+
+    child.once("error", onError);
+    child.once("exit", onExit);
   });
+}
+
+async function terminateProcessTree(child: ChildProcess): Promise<void> {
+  if (!child.pid) {
+    return;
+  }
+
+  if (process.platform === "win32") {
+    await new Promise<void>((resolve) => {
+      execFile("taskkill", ["/PID", String(child.pid), "/T", "/F"], () => resolve());
+    });
+    return;
+  }
+
+  child.kill("SIGKILL");
 }

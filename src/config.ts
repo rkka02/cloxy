@@ -12,6 +12,7 @@ export interface CloxyConfig {
   claudePermissionMode: string;
   codexBinary: string;
   codexSandbox: string;
+  codexTimeoutMs: number;
 }
 
 function normalizeAbsolutePath(input: string): string {
@@ -42,7 +43,8 @@ export function loadConfig(): CloxyConfig {
     claudeBinary: process.env.CLOXY_CLAUDE_BIN ?? "claude",
     claudePermissionMode: process.env.CLOXY_CLAUDE_PERMISSION_MODE ?? "default",
     codexBinary: process.env.CLOXY_CODEX_BIN ?? "codex",
-    codexSandbox: process.env.CLOXY_CODEX_SANDBOX ?? "read-only"
+    codexSandbox: process.env.CLOXY_CODEX_SANDBOX ?? "read-only",
+    codexTimeoutMs: Number(process.env.CLOXY_CODEX_TIMEOUT_MS ?? "900000")
   };
 
   return config;

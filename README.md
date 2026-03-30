@@ -61,6 +61,7 @@ Optional environment variables:
 - `CLOXY_CLAUDE_PERMISSION_MODE`
 - `CLOXY_CODEX_BIN`
 - `CLOXY_CODEX_SANDBOX`
+- `CLOXY_CODEX_TIMEOUT_MS`
 
 ## Models
 

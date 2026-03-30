@@ -72,6 +72,15 @@ const server = Fastify({
   logger: true
 });
 
+server.addHook("onResponse", async (request, reply) => {
+  request.log.info(
+    {
+      statusCode: reply.statusCode
+    },
+    "request completed"
+  );
+});
+
 server.setErrorHandler((error, _request, reply) => {
   const payload = toErrorPayload(error);
   reply.status(payload.statusCode).send({
