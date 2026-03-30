@@ -37,6 +37,13 @@ npm install
 npm run start
 ```
 
+PowerShell on Windows:
+
+```powershell
+npm install
+npm run start
+```
+
 Server defaults:
 
 - host: `127.0.0.1`
@@ -68,6 +75,7 @@ The proxy also accepts simple aliases such as `claude` and `codex`.
 
 - `Authorization: Bearer <token>` if `CLOXY_API_KEY` is configured
 - `X-Cloxy-Working-Directory: /absolute/path` to override the working directory within the configured allowlist
+- Windows absolute paths such as `C:\work\repo` are supported too
 
 Requests are stateless by default. That matches how most OpenAI-compatible clients use `chat.completions`: they resend the relevant message history on every request.
 
@@ -122,6 +130,11 @@ curl http://127.0.0.1:4141/v1/chat/completions \
 - Codex emits machine-readable events, but token-by-token output was not available in the tested command path, so streaming compatibility is coarse.
 - The "fixed cost" thesis only makes sense when the underlying CLI is authenticated in subscription-backed mode rather than API-key billing mode.
 
+## Windows Notes
+
+- Cloxy now launches `claude` and `codex` through the Windows command shell when they are installed as `.cmd` or `.bat` shims.
+- If you use custom binaries, prefer setting `CLOXY_CLAUDE_BIN` and `CLOXY_CODEX_BIN` to the exact command or executable you already run successfully in PowerShell.
+
 ## Architecture
 
-See [docs/architecture.md](/Users/mw/Desktop/cloxy/docs/architecture.md).
+See [docs/architecture.md](docs/architecture.md).

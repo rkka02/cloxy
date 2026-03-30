@@ -56,12 +56,14 @@ This prevents the proxy from becoming an unrestricted local shell bridge by acci
 - JSON mode is used for non-streaming
 - `stream-json` mode is used for SSE
 - tools are disabled by default to avoid nested-agent surprises
+- on Windows, shim-style commands are launched through the shell so `.cmd` installs work
 
 ### Codex
 
 - command path uses `codex exec --json`
 - sandbox defaults to `read-only`
 - JSONL events are translated into a final assistant chunk for stream requests
+- on Windows, shim-style commands are launched through the shell so `.cmd` installs work
 
 ## Non-Goals For MVP
 

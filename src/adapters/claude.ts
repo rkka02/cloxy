@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import type { CloxyConfig } from "../config";
 import type {
   BackendAdapter,
@@ -6,6 +6,7 @@ import type {
   CompletionResult,
   StreamEvent
 } from "./types";
+import { spawnCli } from "./process";
 
 interface ClaudeJsonResult {
   result?: string;
@@ -42,21 +43,21 @@ export class ClaudeAdapter implements BackendAdapter {
       "--output-format=stream-json",
       "--include-partial-messages"
     ]);
-    const child = spawn(this.config.claudeBinary, [...args, "--", params.prompt], {
+    const child = spawnCli(this.config.claudeBinary, [...args, "--", params.prompt], {
       cwd: params.cwd,
       stdio: ["ignore", "pipe", "pipe"]
     });
 
     let stderr = "";
-    child.stderr.setEncoding("utf8");
-    child.stderr.on("data", (chunk) => {
+    child.stderr!.setEncoding("utf8");
+    child.stderr!.on("data", (chunk) => {
       stderr += chunk;
     });
 
     let buffer = "";
-    child.stdout.setEncoding("utf8");
+    child.stdout!.setEncoding("utf8");
 
-    for await (const chunk of child.stdout) {
+    for await (const chunk of child.stdout!) {
       buffer += chunk;
 
       while (true) {
@@ -114,19 +115,19 @@ async function runProcess(input: {
   args: string[];
   cwd: string;
 }): Promise<string> {
-  const child = spawn(input.command, input.args, {
+  const child = spawnCli(input.command, input.args, {
     cwd: input.cwd,
     stdio: ["ignore", "pipe", "pipe"]
   });
 
   let stdout = "";
   let stderr = "";
-  child.stdout.setEncoding("utf8");
-  child.stderr.setEncoding("utf8");
-  child.stdout.on("data", (chunk) => {
+  child.stdout!.setEncoding("utf8");
+  child.stderr!.setEncoding("utf8");
+  child.stdout!.on("data", (chunk) => {
     stdout += chunk;
   });
-  child.stderr.on("data", (chunk) => {
+  child.stderr!.on("data", (chunk) => {
     stderr += chunk;
   });
 
@@ -138,7 +139,7 @@ async function runProcess(input: {
   return stdout;
 }
 
-function waitForExit(child: ReturnType<typeof spawn>): Promise<number | null> {
+function waitForExit(child: ChildProcess): Promise<number | null> {
   return new Promise((resolve, reject) => {
     child.once("error", reject);
     child.once("exit", (code) => resolve(code));

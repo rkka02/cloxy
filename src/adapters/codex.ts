@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import type { CloxyConfig } from "../config";
 import type {
   BackendAdapter,
@@ -6,6 +6,7 @@ import type {
   CompletionResult,
   StreamEvent
 } from "./types";
+import { spawnCli } from "./process";
 
 interface CodexParsedOutput {
   text?: string;
@@ -57,20 +58,20 @@ async function runCodexProcess(
     "-"
   ];
 
-  const child = spawn(config.codexBinary, args, {
+  const child = spawnCli(config.codexBinary, args, {
     cwd: params.cwd,
     stdio: ["pipe", "pipe", "pipe"]
   });
 
   let stdout = "";
   let stderr = "";
-  child.stdin.end(params.prompt);
-  child.stdout.setEncoding("utf8");
-  child.stderr.setEncoding("utf8");
-  child.stdout.on("data", (chunk) => {
+  child.stdin!.end(params.prompt);
+  child.stdout!.setEncoding("utf8");
+  child.stderr!.setEncoding("utf8");
+  child.stdout!.on("data", (chunk) => {
     stdout += chunk;
   });
-  child.stderr.on("data", (chunk) => {
+  child.stderr!.on("data", (chunk) => {
     stderr += chunk;
   });
 
@@ -104,7 +105,7 @@ function parseCodexJsonl(stdout: string): CodexParsedOutput {
   return { text };
 }
 
-function waitForExit(child: ReturnType<typeof spawn>): Promise<number | null> {
+function waitForExit(child: ChildProcess): Promise<number | null> {
   return new Promise((resolve, reject) => {
     child.once("error", reject);
     child.once("exit", (code) => resolve(code));
