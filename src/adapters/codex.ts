@@ -19,6 +19,7 @@ interface CodexParsedOutput {
 
 export class CodexAdapter implements BackendAdapter {
   readonly backend = "codex" as const;
+  readonly usagePolicy = "general" as const;
   readonly capabilities = {
     text: true,
     imageInput: true,

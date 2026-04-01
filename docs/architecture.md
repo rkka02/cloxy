@@ -72,6 +72,7 @@ Image inputs are also guarded before backend handoff:
 ### Claude
 
 - command path uses the Claude Agent SDK against the local Claude Code install
+- model metadata marks this backend as `private-use-only`
 - multimodal requests are sent through SDK streaming input mode so image blocks survive translation
 - stateless requests disable transcript persistence; persisted sessions use SDK resume mode
 - tools are disabled by default to avoid nested-agent surprises

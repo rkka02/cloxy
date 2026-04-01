@@ -18,6 +18,7 @@ import type {
 
 export class ClaudeAdapter implements BackendAdapter {
   readonly backend = "claude" as const;
+  readonly usagePolicy = "private-use-only" as const;
   readonly capabilities = {
     text: true,
     imageInput: true,

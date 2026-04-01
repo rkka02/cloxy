@@ -17,7 +17,7 @@ This project does not try to perfectly emulate every OpenAI endpoint. It focuses
 
 Current backend support:
 
-- `cloxy-claude`: recommended first backend, supports real streaming and image input
+- `cloxy-claude`: supports real streaming and image input, but is marked `private-use-only`
 - `cloxy-codex`: experimental, streams as chunked final text because Codex CLI exposes JSONL events but not token deltas in the tested path; image input is supported
 - `cloxy-gemini`: experimental, supports text input, stream-json parsing, and opt-in session resume; image input is not wired yet
 
@@ -85,6 +85,12 @@ Each model object also includes a `capabilities` block describing support for:
 - `tools`
 - `streaming`
 
+Each model object also includes `usage_policy`.
+
+- `cloxy-claude`: `private-use-only`
+- `cloxy-codex`: `general`
+- `cloxy-gemini`: `general`
+
 ## Headers
 
 - `Authorization: Bearer <token>` if `CLOXY_API_KEY` is configured
@@ -92,6 +98,7 @@ Each model object also includes a `capabilities` block describing support for:
 - Windows absolute paths such as `C:\work\repo` are supported too
 - `X-Cloxy-Session-Mode: persist` to opt into backend-native session persistence
 - `X-Cloxy-Session-Id: <uuid>` to resume a previously persisted Cloxy backend session
+- `X-Cloxy-Usage-Policy` is returned on responses so backend-specific usage restrictions stay visible to callers
 
 Requests are stateless by default. That matches how most OpenAI-compatible clients use `chat.completions`: they resend the relevant message history on every request.
 
@@ -228,6 +235,7 @@ curl http://127.0.0.1:4141/v1/responses \
 - Backend-native tool use is separate from this OpenAI-style tool-call layer.
 - Embeddings are not implemented yet.
 - Session persistence is opt-in and header-based rather than automatic OpenAI conversation storage.
+- `cloxy-claude` is intentionally marked `private-use-only`.
 - Codex emits machine-readable events, but token-by-token output was not available in the tested command path, so streaming compatibility is coarse.
 - Gemini currently supports text-only requests in Cloxy even though the underlying CLI may evolve further.
 - The "fixed cost" thesis only makes sense when the underlying CLI is authenticated in subscription-backed mode rather than API-key billing mode.

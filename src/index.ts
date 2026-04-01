@@ -224,6 +224,7 @@ server.post("/v1/chat/completions", async (request, reply) => {
           "Content-Type": "text/event-stream; charset=utf-8",
           "Cache-Control": "no-cache, no-transform",
           Connection: "keep-alive",
+          ...buildUsagePolicyHeaders(adapter),
           ...buildSessionHeaders(session.mode, responseSessionId)
         });
         reply.raw.write(
@@ -287,6 +288,7 @@ server.post("/v1/chat/completions", async (request, reply) => {
         "Content-Type": "text/event-stream; charset=utf-8",
         "Cache-Control": "no-cache, no-transform",
         Connection: "keep-alive",
+        ...buildUsagePolicyHeaders(adapter),
         ...buildSessionHeaders(session.mode, responseSessionId)
       });
       reply.raw.write(
@@ -359,6 +361,7 @@ server.post("/v1/chat/completions", async (request, reply) => {
     sessionId: session.sessionId
   });
 
+  applyUsagePolicyHeaders(reply, adapter);
   applySessionHeaders(reply, session.mode, result.sessionId);
   reply.code(200);
 
@@ -419,6 +422,7 @@ server.post("/v1/responses", async (request, reply) => {
         "Content-Type": "text/event-stream; charset=utf-8",
         "Cache-Control": "no-cache, no-transform",
         Connection: "keep-alive",
+        ...buildUsagePolicyHeaders(adapter),
         ...buildSessionHeaders(session.mode, responseSessionId)
       });
       reply.raw.write(
@@ -616,6 +620,7 @@ server.post("/v1/responses", async (request, reply) => {
     sessionId: session.sessionId
   });
 
+  applyUsagePolicyHeaders(reply, adapter);
   applySessionHeaders(reply, session.mode, result.sessionId);
   reply.code(200);
 
@@ -675,6 +680,7 @@ function listModels(adapters: Record<BackendName, BackendAdapter>): Array<Record
       object: "model",
       created,
       owned_by: "cloxy",
+      usage_policy: adapters.claude.usagePolicy,
       capabilities: adapters.claude.capabilities
     },
     {
@@ -682,6 +688,7 @@ function listModels(adapters: Record<BackendName, BackendAdapter>): Array<Record
       object: "model",
       created,
       owned_by: "cloxy",
+      usage_policy: adapters.codex.usagePolicy,
       capabilities: adapters.codex.capabilities
     },
     {
@@ -689,6 +696,7 @@ function listModels(adapters: Record<BackendName, BackendAdapter>): Array<Record
       object: "model",
       created,
       owned_by: "cloxy",
+      usage_policy: adapters.gemini.usagePolicy,
       capabilities: adapters.gemini.capabilities
     }
   ];
@@ -759,6 +767,16 @@ function applySessionHeaders(
   }
 }
 
+function applyUsagePolicyHeaders(
+  reply: FastifyReply,
+  adapter: BackendAdapter
+): void {
+  const headers = buildUsagePolicyHeaders(adapter);
+  for (const [name, value] of Object.entries(headers)) {
+    reply.raw.setHeader(name, value);
+  }
+}
+
 function buildSessionHeaders(
   mode: SessionMode,
   sessionId?: string
@@ -766,6 +784,12 @@ function buildSessionHeaders(
   return {
     "X-Cloxy-Session-Mode": mode,
     ...(sessionId ? { "X-Cloxy-Session-Id": sessionId } : {})
+  };
+}
+
+function buildUsagePolicyHeaders(adapter: BackendAdapter): Record<string, string> {
+  return {
+    "X-Cloxy-Usage-Policy": adapter.usagePolicy
   };
 }
 

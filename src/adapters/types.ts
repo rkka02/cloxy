@@ -4,6 +4,7 @@ import type { ConversationMessage } from "../openai";
 export type CodexSandboxMode = "read-only" | "workspace-write" | "danger-full-access";
 export type ClaudePermissionMode = "default" | "acceptEdits" | "bypassPermissions" | "plan" | "dontAsk";
 export type GeminiApprovalMode = "default" | "auto_edit" | "yolo" | "plan";
+export type BackendUsagePolicy = "general" | "private-use-only";
 
 export interface CompletionParams {
   messages: ConversationMessage[];
@@ -38,6 +39,7 @@ export interface StreamEvent {
 export interface BackendAdapter {
   readonly backend: BackendName;
   readonly capabilities: BackendCapabilities;
+  readonly usagePolicy: BackendUsagePolicy;
   complete(params: CompletionParams): Promise<CompletionResult>;
   stream(params: CompletionParams): AsyncGenerator<StreamEvent>;
 }

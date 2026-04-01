@@ -35,6 +35,7 @@ interface GeminiStreamEvent {
 
 export class GeminiAdapter implements BackendAdapter {
   readonly backend = "gemini" as const;
+  readonly usagePolicy = "general" as const;
   readonly capabilities = {
     text: true,
     imageInput: false,
