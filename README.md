@@ -237,8 +237,9 @@ curl http://127.0.0.1:4141/v1/responses \
 
 ## Windows Notes
 
-- Cloxy now launches `claude` and `codex` through the Windows command shell when they are installed as `.cmd` or `.bat` shims.
-- If you use custom binaries, prefer setting `CLOXY_CLAUDE_BIN` and `CLOXY_CODEX_BIN` to the exact command or executable you already run successfully in PowerShell.
+- Cloxy now resolves npm-installed Windows shims for `claude`, `codex`, and `gemini` to their underlying Node entrypoints instead of relying on `cmd.exe` argument forwarding.
+- Explicit PowerShell script paths such as `C:\Users\...\gemini.ps1` are also supported.
+- If you use custom binaries, prefer setting `CLOXY_CLAUDE_BIN`, `CLOXY_CODEX_BIN`, and `CLOXY_GEMINI_BIN` to the exact command or executable you already run successfully in PowerShell.
 - Image smoke tests were verified on Windows by running a second Cloxy instance on a non-default port.
 
 ## Architecture

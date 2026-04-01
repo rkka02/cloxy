@@ -75,7 +75,7 @@ Image inputs are also guarded before backend handoff:
 - multimodal requests are sent through SDK streaming input mode so image blocks survive translation
 - stateless requests disable transcript persistence; persisted sessions use SDK resume mode
 - tools are disabled by default to avoid nested-agent surprises
-- on Windows, shim-style commands are launched through the shell so `.cmd` installs work
+- on Windows, npm shim installs are resolved to their underlying Node entrypoints so arguments survive intact
 
 ### Codex
 
@@ -84,7 +84,7 @@ Image inputs are also guarded before backend handoff:
 - stateless requests use `--ephemeral`; persisted sessions use `codex exec resume`
 - data URL images are materialized to temporary files and attached via `--image`
 - JSONL events are translated into a final assistant chunk for stream requests
-- on Windows, shim-style commands are launched through the shell so `.cmd` installs work
+- on Windows, npm shim installs are resolved to their underlying Node entrypoints so arguments survive intact
 
 ### Gemini
 
@@ -92,6 +92,7 @@ Image inputs are also guarded before backend handoff:
 - stateless requests still create backend sessions internally, but Cloxy only exposes and resumes them when persistence is requested
 - current Cloxy integration is text-only
 - stream-json events are parsed from line-oriented JSON with an initial `init` event carrying the session ID
+- on Windows, npm shims and explicit `.ps1` paths are supported without going through `cmd.exe` argument munging
 
 ## Non-Goals For MVP
 

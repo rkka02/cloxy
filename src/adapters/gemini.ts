@@ -98,7 +98,7 @@ async function runGeminiProcess(
 
   const args = [
     "--approval-mode",
-    "default",
+    "plan",
     "-o",
     outputFormat,
     "-p",
