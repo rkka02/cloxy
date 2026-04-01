@@ -5,7 +5,12 @@ import { ZodError } from "zod";
 import { ClaudeAdapter } from "./adapters/claude";
 import { CodexAdapter } from "./adapters/codex";
 import { GeminiAdapter } from "./adapters/gemini";
-import type { BackendAdapter, CodexSandboxMode } from "./adapters/types";
+import type {
+  BackendAdapter,
+  ClaudePermissionMode,
+  CodexSandboxMode,
+  GeminiApprovalMode
+} from "./adapters/types";
 import {
   loadConfig,
   resolveWorkingDirectory,
@@ -192,6 +197,8 @@ server.post("/v1/chat/completions", async (request, reply) => {
     mergeAllowedRoots(config.allowedRoots, requestWorkspaceRoot)
   );
   const codexSandbox = resolveRequestedCodexSandbox(body, config.codexSandbox);
+  const claudePermissionMode = resolveRequestedClaudePermissionMode(body, config.claudePermissionMode);
+  const geminiApprovalMode = resolveRequestedGeminiApprovalMode(body);
 
   assertBackendCapabilities(adapter, messages, body.stream === true);
 
@@ -206,6 +213,8 @@ server.post("/v1/chat/completions", async (request, reply) => {
           messages: buildBackendMessages(messages, toolConfig, adapter.backend),
           cwd: workingDirectory,
           codexSandbox,
+          claudePermissionMode,
+          geminiApprovalMode,
           persistSession: session.mode === "persist",
           sessionId: session.sessionId
         });
@@ -296,6 +305,8 @@ server.post("/v1/chat/completions", async (request, reply) => {
         messages,
         cwd: workingDirectory,
         codexSandbox,
+        claudePermissionMode,
+        geminiApprovalMode,
         persistSession: session.mode === "persist",
         sessionId: session.sessionId
       })) {
@@ -342,6 +353,8 @@ server.post("/v1/chat/completions", async (request, reply) => {
     messages: buildBackendMessages(messages, toolConfig, adapter.backend),
     cwd: workingDirectory,
     codexSandbox,
+    claudePermissionMode,
+    geminiApprovalMode,
     persistSession: session.mode === "persist",
     sessionId: session.sessionId
   });
@@ -386,6 +399,8 @@ server.post("/v1/responses", async (request, reply) => {
   const session = parseSessionHeaders(request.headers);
   const toolConfig = normalizeTools(body.tools, body.tool_choice);
   const codexSandbox = resolveRequestedCodexSandbox(body, config.codexSandbox);
+  const claudePermissionMode = resolveRequestedClaudePermissionMode(body, config.claudePermissionMode);
+  const geminiApprovalMode = resolveRequestedGeminiApprovalMode(body);
   const messages = prependInstructions(
     normalizeResponsesInput(body.input),
     body.instructions
@@ -421,6 +436,8 @@ server.post("/v1/responses", async (request, reply) => {
           messages: buildBackendMessages(messages, toolConfig, adapter.backend),
           cwd: workingDirectory,
           codexSandbox,
+          claudePermissionMode,
+          geminiApprovalMode,
           persistSession: session.mode === "persist",
           sessionId: session.sessionId
         });
@@ -517,6 +534,8 @@ server.post("/v1/responses", async (request, reply) => {
         messages,
         cwd: workingDirectory,
         codexSandbox,
+        claudePermissionMode,
+        geminiApprovalMode,
         persistSession: session.mode === "persist",
         sessionId: session.sessionId
       })) {
@@ -591,6 +610,8 @@ server.post("/v1/responses", async (request, reply) => {
     messages: buildBackendMessages(messages, toolConfig, adapter.backend),
     cwd: workingDirectory,
     codexSandbox,
+    claudePermissionMode,
+    geminiApprovalMode,
     persistSession: session.mode === "persist",
     sessionId: session.sessionId
   });
@@ -867,6 +888,90 @@ function resolveRequestedCodexSandbox(
   }
 
   return "read-only";
+}
+
+function resolveRequestedClaudePermissionMode(
+  body: {
+    workspace?: {
+      permissionMode?: string;
+      permissions?: {
+        write?: boolean;
+        execute?: boolean;
+      };
+    };
+    permission_mode?: string;
+    permissions?: {
+      write?: boolean;
+      execute?: boolean;
+    };
+    dangerously_skip_permissions?: boolean;
+  },
+  fallback: string
+): ClaudePermissionMode {
+  const requestedPermissionMode = firstNonEmptyString(
+    body.permission_mode,
+    body.workspace?.permissionMode
+  );
+  const writeEnabled = body.permissions?.write ?? body.workspace?.permissions?.write;
+  const executeEnabled = body.permissions?.execute ?? body.workspace?.permissions?.execute;
+
+  if (
+    body.dangerously_skip_permissions === true ||
+    requestedPermissionMode === "dangerously-skip-permissions"
+  ) {
+    return "bypassPermissions";
+  }
+
+  if (writeEnabled === true || executeEnabled === true) {
+    return "acceptEdits";
+  }
+
+  if (
+    fallback === "default" ||
+    fallback === "acceptEdits" ||
+    fallback === "bypassPermissions" ||
+    fallback === "plan" ||
+    fallback === "dontAsk"
+  ) {
+    return fallback;
+  }
+
+  return "plan";
+}
+
+function resolveRequestedGeminiApprovalMode(
+  body: {
+    workspace?: {
+      permissionMode?: string;
+      permissions?: {
+        write?: boolean;
+      };
+    };
+    permission_mode?: string;
+    permissions?: {
+      write?: boolean;
+    };
+    dangerously_skip_permissions?: boolean;
+  }
+): GeminiApprovalMode {
+  const requestedPermissionMode = firstNonEmptyString(
+    body.permission_mode,
+    body.workspace?.permissionMode
+  );
+  const writeEnabled = body.permissions?.write ?? body.workspace?.permissions?.write;
+
+  if (
+    body.dangerously_skip_permissions === true ||
+    requestedPermissionMode === "dangerously-skip-permissions"
+  ) {
+    return "yolo";
+  }
+
+  if (writeEnabled === true) {
+    return "auto_edit";
+  }
+
+  return "plan";
 }
 
 function firstNonEmptyString(...values: Array<string | undefined>): string | undefined {

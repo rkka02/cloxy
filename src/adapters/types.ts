@@ -2,6 +2,8 @@ import type { BackendName } from "../config";
 import type { ConversationMessage } from "../openai";
 
 export type CodexSandboxMode = "read-only" | "workspace-write" | "danger-full-access";
+export type ClaudePermissionMode = "default" | "acceptEdits" | "bypassPermissions" | "plan" | "dontAsk";
+export type GeminiApprovalMode = "default" | "auto_edit" | "yolo" | "plan";
 
 export interface CompletionParams {
   messages: ConversationMessage[];
@@ -9,6 +11,8 @@ export interface CompletionParams {
   persistSession: boolean;
   sessionId?: string;
   codexSandbox?: CodexSandboxMode;
+  claudePermissionMode?: ClaudePermissionMode;
+  geminiApprovalMode?: GeminiApprovalMode;
 }
 
 export interface CompletionResult {

@@ -5,6 +5,7 @@ import type {
   BackendAdapter,
   CompletionParams,
   CompletionResult,
+  GeminiApprovalMode,
   StreamEvent
 } from "./types";
 import { spawnCli, waitForExit } from "./process";
@@ -95,10 +96,11 @@ async function runGeminiProcess(
   const prompt = renderTranscript(params.messages, {
     includeImagePlaceholders: false
   });
+  const approvalMode = params.geminiApprovalMode ?? "plan";
 
   const args = [
     "--approval-mode",
-    "plan",
+    approvalMode,
     "-o",
     outputFormat,
     "-p",

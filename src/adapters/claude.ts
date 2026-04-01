@@ -10,6 +10,7 @@ import { CloxyHttpError } from "../errors";
 import type { ConversationMessage, MessageContentPart } from "../openai";
 import type {
   BackendAdapter,
+  ClaudePermissionMode,
   CompletionParams,
   CompletionResult,
   StreamEvent
@@ -96,18 +97,20 @@ async function* runClaudeQuery(
   params: CompletionParams,
   includePartialMessages: boolean
 ): AsyncGenerator<SDKMessage> {
+  const permissionMode = params.claudePermissionMode ?? (config.claudePermissionMode as ClaudePermissionMode);
+  const maxTurns = permissionMode === "plan" ? 1 : 8;
   const session = query({
     prompt: createClaudeInput(params.messages),
     options: {
       cwd: params.cwd,
       includePartialMessages,
-      maxTurns: 1,
+      maxTurns,
       pathToClaudeCodeExecutable: config.claudeBinary,
-      permissionMode: config.claudePermissionMode as PermissionMode,
+      permissionMode: permissionMode as PermissionMode,
+      allowDangerouslySkipPermissions: permissionMode === "bypassPermissions",
       persistSession: params.persistSession,
       resume: params.sessionId,
-      systemPrompt: buildClaudeSystemPrompt(params.messages),
-      tools: []
+      systemPrompt: buildClaudeSystemPrompt(params.messages)
     }
   });
 
