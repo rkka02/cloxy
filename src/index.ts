@@ -1,10 +1,11 @@
 import Fastify, { type FastifyReply } from "fastify";
+import path from "node:path";
 import { z } from "zod";
 import { ZodError } from "zod";
 import { ClaudeAdapter } from "./adapters/claude";
 import { CodexAdapter } from "./adapters/codex";
 import { GeminiAdapter } from "./adapters/gemini";
-import type { BackendAdapter } from "./adapters/types";
+import type { BackendAdapter, CodexSandboxMode } from "./adapters/types";
 import {
   loadConfig,
   resolveWorkingDirectory,
@@ -42,6 +43,17 @@ interface SessionRequest {
 }
 
 const contentPartSchema = z.object({ type: z.string() }).passthrough();
+const workspacePermissionsSchema = z.object({
+  read: z.boolean().optional(),
+  write: z.boolean().optional(),
+  execute: z.boolean().optional()
+});
+const workspaceSchema = z.object({
+  rootDir: z.string().optional(),
+  cwd: z.string().optional(),
+  permissionMode: z.string().optional(),
+  permissions: workspacePermissionsSchema.optional()
+});
 const messageSchema = z.object({
   role: z.enum(["system", "user", "assistant", "tool"]),
   content: z.union([z.string(), z.array(contentPartSchema), z.null()]),
@@ -69,7 +81,13 @@ const chatCompletionSchema = z.object({
   stream: z.boolean().optional(),
   user: z.string().optional(),
   tools: z.array(z.unknown()).optional(),
-  tool_choice: z.unknown().optional()
+  tool_choice: z.unknown().optional(),
+  workspace: workspaceSchema.optional(),
+  cwd: z.string().optional(),
+  workspace_root: z.string().optional(),
+  permission_mode: z.string().optional(),
+  permissions: workspacePermissionsSchema.optional(),
+  dangerously_skip_permissions: z.boolean().optional()
 });
 
 const responsesInputItemSchema = z.object({
@@ -91,7 +109,13 @@ const responsesSchema = z.object({
   instructions: z.string().optional(),
   stream: z.boolean().optional(),
   tools: z.array(z.unknown()).optional(),
-  tool_choice: z.unknown().optional()
+  tool_choice: z.unknown().optional(),
+  workspace: workspaceSchema.optional(),
+  cwd: z.string().optional(),
+  workspace_root: z.string().optional(),
+  permission_mode: z.string().optional(),
+  permissions: workspacePermissionsSchema.optional(),
+  dangerously_skip_permissions: z.boolean().optional()
 });
 
 const config = loadConfig();
@@ -162,10 +186,12 @@ server.post("/v1/chat/completions", async (request, reply) => {
   const messages = normalizeChatMessages(body.messages);
   const toolConfig = normalizeTools(body.tools, body.tool_choice);
   const session = parseSessionHeaders(request.headers);
+  const requestWorkspaceRoot = getRequestedWorkspaceRoot(body);
   const workingDirectory = resolveWorkingDirectory(
-    getHeaderValue(request.headers["x-cloxy-working-directory"]),
-    config.allowedRoots
+    getRequestedWorkingDirectory(request.headers, body),
+    mergeAllowedRoots(config.allowedRoots, requestWorkspaceRoot)
   );
+  const codexSandbox = resolveRequestedCodexSandbox(body, config.codexSandbox);
 
   assertBackendCapabilities(adapter, messages, body.stream === true);
 
@@ -179,6 +205,7 @@ server.post("/v1/chat/completions", async (request, reply) => {
         const result = await adapter.complete({
           messages: buildBackendMessages(messages, toolConfig, adapter.backend),
           cwd: workingDirectory,
+          codexSandbox,
           persistSession: session.mode === "persist",
           sessionId: session.sessionId
         });
@@ -268,6 +295,7 @@ server.post("/v1/chat/completions", async (request, reply) => {
       for await (const event of adapter.stream({
         messages,
         cwd: workingDirectory,
+        codexSandbox,
         persistSession: session.mode === "persist",
         sessionId: session.sessionId
       })) {
@@ -313,6 +341,7 @@ server.post("/v1/chat/completions", async (request, reply) => {
   const result = await adapter.complete({
     messages: buildBackendMessages(messages, toolConfig, adapter.backend),
     cwd: workingDirectory,
+    codexSandbox,
     persistSession: session.mode === "persist",
     sessionId: session.sessionId
   });
@@ -349,12 +378,14 @@ server.post("/v1/responses", async (request, reply) => {
   const body = responsesSchema.parse(request.body);
   const backend = resolveBackend(body.model, config.defaultBackend);
   const adapter = adapters[backend];
+  const requestWorkspaceRoot = getRequestedWorkspaceRoot(body);
   const workingDirectory = resolveWorkingDirectory(
-    getHeaderValue(request.headers["x-cloxy-working-directory"]),
-    config.allowedRoots
+    getRequestedWorkingDirectory(request.headers, body),
+    mergeAllowedRoots(config.allowedRoots, requestWorkspaceRoot)
   );
   const session = parseSessionHeaders(request.headers);
   const toolConfig = normalizeTools(body.tools, body.tool_choice);
+  const codexSandbox = resolveRequestedCodexSandbox(body, config.codexSandbox);
   const messages = prependInstructions(
     normalizeResponsesInput(body.input),
     body.instructions
@@ -389,6 +420,7 @@ server.post("/v1/responses", async (request, reply) => {
         const result = await adapter.complete({
           messages: buildBackendMessages(messages, toolConfig, adapter.backend),
           cwd: workingDirectory,
+          codexSandbox,
           persistSession: session.mode === "persist",
           sessionId: session.sessionId
         });
@@ -484,6 +516,7 @@ server.post("/v1/responses", async (request, reply) => {
       for await (const event of adapter.stream({
         messages,
         cwd: workingDirectory,
+        codexSandbox,
         persistSession: session.mode === "persist",
         sessionId: session.sessionId
       })) {
@@ -557,6 +590,7 @@ server.post("/v1/responses", async (request, reply) => {
   const result = await adapter.complete({
     messages: buildBackendMessages(messages, toolConfig, adapter.backend),
     cwd: workingDirectory,
+    codexSandbox,
     persistSession: session.mode === "persist",
     sessionId: session.sessionId
   });
@@ -745,6 +779,105 @@ function buildBackendMessages(
       ]
     }
   ];
+}
+
+function getRequestedWorkingDirectory(
+  headers: Record<string, string | string[] | undefined>,
+  body: {
+    cwd?: string;
+    workspace_root?: string;
+    workspace?: {
+      cwd?: string;
+      rootDir?: string;
+    };
+  }
+): string | undefined {
+  return firstNonEmptyString(
+    getHeaderValue(headers["x-cloxy-working-directory"]),
+    body.cwd,
+    body.workspace?.cwd,
+    body.workspace_root,
+    body.workspace?.rootDir
+  );
+}
+
+function getRequestedWorkspaceRoot(body: {
+  workspace_root?: string;
+  cwd?: string;
+  workspace?: {
+    rootDir?: string;
+    cwd?: string;
+  };
+}): string | undefined {
+  return firstNonEmptyString(
+    body.workspace_root,
+    body.workspace?.rootDir,
+    body.cwd,
+    body.workspace?.cwd
+  );
+}
+
+function mergeAllowedRoots(allowedRoots: string[], requestRoot?: string): string[] {
+  if (!requestRoot) {
+    return allowedRoots;
+  }
+
+  return [...new Set([...allowedRoots, path.resolve(requestRoot)])];
+}
+
+function resolveRequestedCodexSandbox(
+  body: {
+    workspace?: {
+      permissionMode?: string;
+      permissions?: {
+        write?: boolean;
+      };
+    };
+    permission_mode?: string;
+    permissions?: {
+      write?: boolean;
+    };
+    dangerously_skip_permissions?: boolean;
+  },
+  fallback: string
+): CodexSandboxMode {
+  const requestedPermissionMode = firstNonEmptyString(
+    body.permission_mode,
+    body.workspace?.permissionMode
+  );
+  const writeEnabled = body.permissions?.write ?? body.workspace?.permissions?.write;
+
+  if (
+    body.dangerously_skip_permissions === true ||
+    requestedPermissionMode === "dangerously-skip-permissions"
+  ) {
+    return "danger-full-access";
+  }
+
+  if (writeEnabled === true) {
+    return "workspace-write";
+  }
+
+  if (
+    fallback === "read-only" ||
+    fallback === "workspace-write" ||
+    fallback === "danger-full-access"
+  ) {
+    return fallback;
+  }
+
+  return "read-only";
+}
+
+function firstNonEmptyString(...values: Array<string | undefined>): string | undefined {
+  for (const value of values) {
+    const trimmed = value?.trim();
+    if (trimmed) {
+      return trimmed;
+    }
+  }
+
+  return undefined;
 }
 
 function assertBackendCapabilities(

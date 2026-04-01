@@ -5,6 +5,7 @@ import type { CloxyConfig } from "../config";
 import { renderTranscript } from "../openai";
 import type {
   BackendAdapter,
+  CodexSandboxMode,
   CompletionParams,
   CompletionResult,
   StreamEvent
@@ -69,7 +70,8 @@ async function runCodexProcess(
   params: CompletionParams
 ): Promise<CodexParsedOutput> {
   const imageTempDir = await createImageTempDir(params);
-  const resumeModeArgs = buildResumeModeArgs(config.codexSandbox);
+  const sandbox = params.codexSandbox ?? (config.codexSandbox as CodexSandboxMode);
+  const resumeModeArgs = buildResumeModeArgs(sandbox);
   const args = params.sessionId
     ? [
         "exec",
@@ -85,9 +87,7 @@ async function runCodexProcess(
         "exec",
         "--skip-git-repo-check",
         "--json",
-        "--sandbox",
-        config.codexSandbox,
-        ...(params.persistSession ? [] : ["--ephemeral"]),
+        ...buildExecModeArgs(sandbox, params.persistSession),
         ...imageTempDir.args,
         "-"
       ];
@@ -193,4 +193,17 @@ function buildResumeModeArgs(codexSandbox: string): string[] {
   }
 
   return [];
+}
+
+function buildExecModeArgs(
+  codexSandbox: CodexSandboxMode,
+  persistSession: boolean
+): string[] {
+  const persistenceArgs = persistSession ? [] : ["--ephemeral"];
+
+  if (codexSandbox === "danger-full-access") {
+    return ["--dangerously-bypass-approvals-and-sandbox", ...persistenceArgs];
+  }
+
+  return ["--sandbox", codexSandbox, ...persistenceArgs];
 }
