@@ -70,12 +70,14 @@ async function runCodexProcess(
   params: CompletionParams
 ): Promise<CodexParsedOutput> {
   const imageTempDir = await createImageTempDir(params);
+  const resumeModeArgs = buildResumeModeArgs(config.codexSandbox);
   const args = params.sessionId
     ? [
         "exec",
         "resume",
         "--json",
         "--skip-git-repo-check",
+        ...resumeModeArgs,
         ...imageTempDir.args,
         params.sessionId,
         "-"
@@ -180,6 +182,18 @@ function parseCodexJsonl(stdout: string): CodexParsedOutput {
   }
 
   return { text, sessionId };
+}
+
+function buildResumeModeArgs(codexSandbox: string): string[] {
+  if (codexSandbox === "danger-full-access") {
+    return ["--dangerously-bypass-approvals-and-sandbox"];
+  }
+
+  if (codexSandbox === "workspace-write") {
+    return ["--full-auto"];
+  }
+
+  return [];
 }
 
 function waitForExit(
