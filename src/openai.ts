@@ -11,10 +11,41 @@ export interface ChatMessageInputPart {
   [key: string]: unknown;
 }
 
+export interface ToolFunctionDefinition {
+  name: string;
+  description?: string;
+  parameters?: Record<string, unknown>;
+}
+
+export interface ToolDefinition {
+  type: "function";
+  function: ToolFunctionDefinition;
+}
+
+export interface ToolChoiceFunction {
+  type: "function";
+  function: {
+    name: string;
+  };
+}
+
+export type ToolChoice = "auto" | "none" | "required" | ToolChoiceFunction;
+
+export interface ToolCallInput {
+  id?: string;
+  type?: string;
+  function?: {
+    name?: string;
+    arguments?: string;
+  };
+}
+
 export interface ChatMessageInput {
   role: ChatRole;
-  content: string | ChatMessageInputPart[];
+  content: string | ChatMessageInputPart[] | null;
   name?: string;
+  tool_call_id?: string;
+  tool_calls?: ToolCallInput[];
 }
 
 export interface ChatCompletionRequestBody {
@@ -31,6 +62,10 @@ export interface ResponseInputItem {
   text?: string;
   image_url?: unknown;
   detail?: unknown;
+  call_id?: unknown;
+  name?: unknown;
+  arguments?: unknown;
+  output?: unknown;
 }
 
 export interface TextContentPart {
@@ -48,10 +83,21 @@ export interface ImageContentPart {
 
 export type MessageContentPart = TextContentPart | ImageContentPart;
 
+export interface PlannedToolCall {
+  id: string;
+  type: "function";
+  function: {
+    name: string;
+    arguments: string;
+  };
+}
+
 export interface ConversationMessage {
   role: ChatRole;
   content: MessageContentPart[];
   name?: string;
+  toolCallId?: string;
+  toolCalls?: PlannedToolCall[];
 }
 
 export interface OpenAIModelObject {
@@ -77,11 +123,17 @@ export function createMessageId(): string {
   return `msg_${randomUUID().replace(/-/g, "")}`;
 }
 
+export function createToolCallId(): string {
+  return `call_${randomUUID().replace(/-/g, "")}`;
+}
+
 export function normalizeChatMessages(messages: ChatMessageInput[]): ConversationMessage[] {
   const normalized = messages.map((message) => ({
     role: message.role,
     content: normalizeMessageContent(message.content),
-    name: message.name
+    name: message.name,
+    toolCallId: message.tool_call_id,
+    toolCalls: normalizeToolCalls(message.tool_calls)
   }));
 
   enforceImageConstraints(normalized);
@@ -112,6 +164,41 @@ export function normalizeResponsesInput(input: string | ResponseInputItem[]): Co
       messages.push({
         role: "user",
         content: [normalizeImagePart(item.image_url, item.detail)]
+      });
+      continue;
+    }
+
+    if (item.type === "function_call_output") {
+      if (typeof item.call_id !== "string") {
+        throw new CloxyHttpError("Function call output is missing call_id.", 400);
+      }
+
+      messages.push({
+        role: "tool",
+        content: normalizeToolOutputContent(item.output),
+        toolCallId: item.call_id
+      });
+      continue;
+    }
+
+    if (item.type === "function_call") {
+      if (typeof item.name !== "string") {
+        throw new CloxyHttpError("Function call item is missing a function name.", 400);
+      }
+
+      messages.push({
+        role: "assistant",
+        content: [],
+        toolCalls: [
+          {
+            id: typeof item.call_id === "string" ? item.call_id : createToolCallId(),
+            type: "function",
+            function: {
+              name: item.name,
+              arguments: normalizeToolArguments(item.arguments)
+            }
+          }
+        ]
       });
       continue;
     }
@@ -162,7 +249,8 @@ export function renderTranscript(
   const conversation = messages
     .filter((message) => message.role !== "system")
     .map((message) => {
-      const label = message.name ? `${message.role}:${message.name}` : message.role;
+      const label = renderConversationLabel(message);
+      const parts: string[] = [];
       const content = renderMessageContent(message.content, {
         includeImagePlaceholders: options?.includeImagePlaceholders ?? false,
         nextImageIndex: () => {
@@ -170,7 +258,15 @@ export function renderTranscript(
           return imageIndex;
         }
       }).trim();
-      return `${label.toUpperCase()}:\n${content}`;
+      if (content) {
+        parts.push(content);
+      }
+
+      if (message.toolCalls?.length) {
+        parts.push(renderToolCallsForTranscript(message.toolCalls));
+      }
+
+      return `${label.toUpperCase()}:\n${parts.join("\n")}`;
     })
     .join("\n\n");
 
@@ -203,6 +299,27 @@ export function prependInstructions(
     },
     ...messages
   ];
+}
+
+export function renderToolPlanningPrompt(input: {
+  messages: ConversationMessage[];
+  tools: ToolDefinition[];
+  toolChoice: ToolChoice;
+  includeImagePlaceholders?: boolean;
+}): string {
+  return [
+    "You are a helpful AI assistant.",
+    "You may either answer normally or request one or more function calls.",
+    "Return strictly valid JSON and no markdown.",
+    'If you want to answer directly, return {"type":"assistant","content":"..."}',
+    'If you want to call tool(s), return {"type":"tool_calls","tool_calls":[{"name":"tool_name","arguments":{}}]}',
+    "Arguments must be valid JSON objects.",
+    renderToolChoiceInstruction(input.toolChoice),
+    `AVAILABLE TOOLS:\n${renderAvailableTools(input.tools)}`,
+    renderTranscript(input.messages, {
+      includeImagePlaceholders: input.includeImagePlaceholders
+    })
+  ].join("\n\n");
 }
 
 export function toModelAlias(input: string): string {
@@ -249,6 +366,41 @@ export function formatChatCompletion(
   };
 }
 
+export function formatChatToolCompletion(
+  requestModel: string,
+  toolCalls: PlannedToolCall[],
+  options?: {
+    sessionMode?: "stateless" | "persist";
+    sessionId?: string;
+  }
+): Record<string, unknown> {
+  return {
+    id: createCompletionId(),
+    object: "chat.completion",
+    created: nowSeconds(),
+    model: requestModel,
+    ...(options?.sessionMode
+      ? {
+          cloxy: {
+            session_mode: options.sessionMode,
+            ...(options.sessionId ? { session_id: options.sessionId } : {})
+          }
+        }
+      : {}),
+    choices: [
+      {
+        index: 0,
+        message: {
+          role: "assistant",
+          content: null,
+          tool_calls: toolCalls
+        },
+        finish_reason: "tool_calls"
+      }
+    ]
+  };
+}
+
 export function formatChatStreamChunk(
   id: string,
   model: string,
@@ -268,6 +420,28 @@ export function formatChatStreamChunk(
       }
     ]
   };
+}
+
+export function formatResponseToolObject(
+  requestModel: string,
+  toolCalls: PlannedToolCall[],
+  instructions?: string,
+  options?: {
+    sessionMode?: "stateless" | "persist";
+    sessionId?: string;
+  }
+): Record<string, unknown> {
+  return buildResponseObject({
+    id: createResponseId(),
+    messageId: createMessageId(),
+    requestModel,
+    text: "",
+    instructions,
+    status: "completed",
+    sessionMode: options?.sessionMode,
+    sessionId: options?.sessionId,
+    toolCalls
+  });
 }
 
 export function formatResponseObject(
@@ -344,24 +518,34 @@ function buildResponseObject(input: {
   status: "in_progress" | "completed";
   sessionMode?: "stateless" | "persist";
   sessionId?: string;
+  toolCalls?: PlannedToolCall[];
 }): Record<string, unknown> {
   const output =
     input.status === "completed"
-      ? [
-          {
+      ? input.toolCalls?.length
+        ? input.toolCalls.map((toolCall) => ({
             id: input.messageId,
-            type: "message",
+            type: "function_call",
             status: "completed",
-            role: "assistant",
-            content: [
-              {
-                type: "output_text",
-                text: input.text,
-                annotations: []
-              }
-            ]
-          }
-        ]
+            call_id: toolCall.id,
+            name: toolCall.function.name,
+            arguments: toolCall.function.arguments
+          }))
+        : [
+            {
+              id: input.messageId,
+              type: "message",
+              status: "completed",
+              role: "assistant",
+              content: [
+                {
+                  type: "output_text",
+                  text: input.text,
+                  annotations: []
+                }
+              ]
+            }
+          ]
       : [];
 
   return {
@@ -393,9 +577,123 @@ function buildResponseObject(input: {
     usage: null,
     metadata: {
       ...(input.sessionMode ? { cloxy_session_mode: input.sessionMode } : {}),
-      ...(input.sessionId ? { cloxy_session_id: input.sessionId } : {})
+      ...(input.sessionId ? { cloxy_session_id: input.sessionId } : {}),
+      ...(input.toolCalls?.length ? { cloxy_tool_call_count: input.toolCalls.length } : {})
     }
   };
+}
+
+export function normalizeTools(
+  tools: unknown,
+  toolChoice: unknown
+): {
+  tools: ToolDefinition[];
+  toolChoice: ToolChoice;
+} {
+  if (tools === undefined) {
+    return {
+      tools: [],
+      toolChoice: "none"
+    };
+  }
+
+  if (!Array.isArray(tools)) {
+    throw new CloxyHttpError("tools must be an array.", 400);
+  }
+
+  const normalizedTools = tools.map((tool) => normalizeToolDefinition(tool));
+  const normalizedToolChoice = normalizeToolChoice(toolChoice, normalizedTools);
+
+  return {
+    tools: normalizedTools,
+    toolChoice: normalizedToolChoice
+  };
+}
+
+export function parseToolPlannerResult(
+  text: string,
+  context: {
+    toolChoice: ToolChoice;
+    tools: ToolDefinition[];
+  }
+):
+  | { type: "assistant"; content: string }
+  | { type: "tool_calls"; toolCalls: PlannedToolCall[] } {
+  const parsed = parseJsonObject(text);
+  if (!parsed || typeof parsed !== "object") {
+    if (context.toolChoice === "required" || typeof context.toolChoice === "object") {
+      throw new Error("Backend did not return valid JSON for the requested tool call.");
+    }
+
+    return {
+      type: "assistant",
+      content: text.trim()
+    };
+  }
+
+  if (parsed.type === "assistant") {
+    if (typeof parsed.content !== "string") {
+      throw new Error("Tool planner assistant response is missing string content.");
+    }
+
+    if (context.toolChoice === "required" || typeof context.toolChoice === "object") {
+      throw new Error("Tool choice required a function call, but backend returned assistant text.");
+    }
+
+    return {
+      type: "assistant",
+      content: parsed.content
+    };
+  }
+
+  if (parsed.type === "tool_calls") {
+    if (!Array.isArray(parsed.tool_calls) || parsed.tool_calls.length === 0) {
+      throw new Error("Tool planner response did not include any tool calls.");
+    }
+
+    const availableToolNames = new Set(context.tools.map((tool) => tool.function.name));
+    const toolCalls = parsed.tool_calls.map((toolCall: unknown) => {
+      if (typeof toolCall !== "object" || toolCall === null) {
+        throw new Error("Tool call must be an object.");
+      }
+
+      const name =
+        "name" in toolCall && typeof toolCall.name === "string"
+          ? toolCall.name
+          : undefined;
+      const argumentsValue =
+        "arguments" in toolCall ? toolCall.arguments : undefined;
+
+      if (!name || !availableToolNames.has(name)) {
+        throw new Error(`Tool call referenced unknown tool: ${name ?? "unknown"}`);
+      }
+
+      return {
+        id: createToolCallId(),
+        type: "function" as const,
+        function: {
+          name,
+          arguments: normalizeToolArguments(argumentsValue)
+        }
+      };
+    });
+
+    if (typeof context.toolChoice === "object") {
+      const requiredName = context.toolChoice.function.name;
+      if (toolCalls.length !== 1 || toolCalls[0].function.name !== requiredName) {
+        throw new Error(
+          `Tool choice required function ${requiredName}, but backend returned a different tool call.`
+        );
+      }
+    }
+
+    return {
+      type: "tool_calls",
+      toolCalls
+    };
+  }
+
+  throw new Error("Tool planner response has unsupported type.");
 }
 
 function normalizeResponseRole(role: string): ChatRole {
@@ -410,7 +708,13 @@ function normalizeResponseRole(role: string): ChatRole {
   throw new CloxyHttpError(`Unsupported responses role: ${role}`, 400);
 }
 
-function normalizeMessageContent(content: string | ChatMessageInputPart[]): MessageContentPart[] {
+function normalizeMessageContent(
+  content: string | ChatMessageInputPart[] | null
+): MessageContentPart[] {
+  if (content === null) {
+    return [];
+  }
+
   if (typeof content === "string") {
     return [{ type: "text", text: content }];
   }
@@ -432,6 +736,35 @@ function normalizeContentValue(content: unknown): MessageContentPart[] {
 
 function normalizeContentArray(content: unknown[]): MessageContentPart[] {
   return content.map((part) => normalizeContentPart(part));
+}
+
+function normalizeToolCalls(toolCalls: ToolCallInput[] | undefined): PlannedToolCall[] | undefined {
+  if (!toolCalls || toolCalls.length === 0) {
+    return undefined;
+  }
+
+  return toolCalls.map((toolCall) => {
+    if (toolCall.type !== undefined && toolCall.type !== "function") {
+      throw new CloxyHttpError(
+        `Unsupported tool call type: ${String(toolCall.type)}`,
+        400
+      );
+    }
+
+    const name = toolCall.function?.name;
+    if (!name) {
+      throw new CloxyHttpError("Assistant tool call is missing a function name.", 400);
+    }
+
+    return {
+      id: toolCall.id ?? createToolCallId(),
+      type: "function",
+      function: {
+        name,
+        arguments: normalizeToolArguments(toolCall.function?.arguments)
+      }
+    };
+  });
 }
 
 function normalizeContentPart(part: unknown): MessageContentPart {
@@ -459,6 +792,131 @@ function normalizeContentPart(part: unknown): MessageContentPart {
   }
 
   throw new CloxyHttpError(`Unsupported content part type: ${String(type)}`, 400);
+}
+
+function normalizeToolDefinition(tool: unknown): ToolDefinition {
+  if (typeof tool !== "object" || tool === null) {
+    throw new CloxyHttpError("Tool definition must be an object.", 400);
+  }
+
+  const candidate = tool as {
+    type?: unknown;
+    function?: {
+      name?: unknown;
+      description?: unknown;
+      parameters?: unknown;
+    };
+  };
+
+  if (candidate.type !== "function") {
+    throw new UnsupportedFeatureError("Only function tools are supported right now.");
+  }
+
+  if (!candidate.function || typeof candidate.function.name !== "string") {
+    throw new CloxyHttpError("Function tool is missing a valid name.", 400);
+  }
+
+  return {
+    type: "function",
+    function: {
+      name: candidate.function.name,
+      ...(typeof candidate.function.description === "string"
+        ? { description: candidate.function.description }
+        : {}),
+      ...(candidate.function.parameters &&
+      typeof candidate.function.parameters === "object" &&
+      !Array.isArray(candidate.function.parameters)
+        ? { parameters: candidate.function.parameters as Record<string, unknown> }
+        : {})
+    }
+  };
+}
+
+function normalizeToolChoice(
+  toolChoice: unknown,
+  tools: ToolDefinition[]
+): ToolChoice {
+  if (toolChoice === undefined || toolChoice === null) {
+    return tools.length > 0 ? "auto" : "none";
+  }
+
+  if (toolChoice === "auto" || toolChoice === "none" || toolChoice === "required") {
+    return toolChoice;
+  }
+
+  if (typeof toolChoice !== "object" || toolChoice === null) {
+    throw new CloxyHttpError("tool_choice is invalid.", 400);
+  }
+
+  const candidate = toolChoice as {
+    type?: unknown;
+    function?: {
+      name?: unknown;
+    };
+  };
+
+  if (
+    candidate.type !== "function" ||
+    !candidate.function ||
+    typeof candidate.function.name !== "string"
+  ) {
+    throw new CloxyHttpError("tool_choice must reference a valid function name.", 400);
+  }
+
+  const exists = tools.some((tool) => tool.function.name === candidate.function!.name);
+  if (!exists) {
+    throw new CloxyHttpError(
+      `tool_choice referenced unknown tool: ${candidate.function.name}`,
+      400
+    );
+  }
+
+  return {
+    type: "function",
+    function: {
+      name: candidate.function.name
+    }
+  };
+}
+
+function normalizeToolArguments(argumentsValue: unknown): string {
+  if (argumentsValue === undefined) {
+    return "{}";
+  }
+
+  if (typeof argumentsValue === "string") {
+    try {
+      const parsed = JSON.parse(argumentsValue) as unknown;
+      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+        throw new Error("Tool call arguments must decode to an object.");
+      }
+
+      return JSON.stringify(parsed);
+    } catch (error) {
+      throw new CloxyHttpError(
+        error instanceof Error ? error.message : "Tool call arguments are not valid JSON.",
+        400
+      );
+    }
+  }
+
+  if (typeof argumentsValue !== "object" || argumentsValue === null || Array.isArray(argumentsValue)) {
+    throw new CloxyHttpError("Tool call arguments must be an object.", 400);
+  }
+
+  return JSON.stringify(argumentsValue);
+}
+
+function normalizeToolOutputContent(output: unknown): MessageContentPart[] {
+  if (typeof output === "string") {
+    return [{ type: "text", text: output }];
+  }
+
+  if (output === undefined) {
+    return [{ type: "text", text: "" }];
+  }
+
+  return [{ type: "text", text: JSON.stringify(output) }];
 }
 
 function normalizeImagePart(imageValue: unknown, detailOverride?: unknown): ImageContentPart {
@@ -621,3 +1079,88 @@ function formatBytes(bytes: number): string {
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 const MAX_TOTAL_IMAGE_BYTES = 40 * 1024 * 1024;
 const MAX_IMAGE_COUNT = 16;
+
+function renderConversationLabel(message: ConversationMessage): string {
+  if (message.role === "tool") {
+    if (message.name && message.toolCallId) {
+      return `tool:${message.name}:${message.toolCallId}`;
+    }
+    if (message.name) {
+      return `tool:${message.name}`;
+    }
+    if (message.toolCallId) {
+      return `tool:${message.toolCallId}`;
+    }
+  }
+
+  return message.name ? `${message.role}:${message.name}` : message.role;
+}
+
+function renderToolCallsForTranscript(toolCalls: PlannedToolCall[]): string {
+  return toolCalls
+    .map(
+      (toolCall) =>
+        `[TOOL CALL ${toolCall.id}] ${toolCall.function.name}\nARGUMENTS:\n${toolCall.function.arguments}`
+    )
+    .join("\n");
+}
+
+function renderAvailableTools(tools: ToolDefinition[]): string {
+  return tools
+    .map((tool) => {
+      const description = tool.function.description?.trim();
+      const parameters = tool.function.parameters
+        ? JSON.stringify(tool.function.parameters, null, 2)
+        : "{}";
+
+      return [
+        `- ${tool.function.name}`,
+        description ? `  description: ${description}` : "",
+        `  parameters_json_schema: ${parameters}`
+      ]
+        .filter(Boolean)
+        .join("\n");
+    })
+    .join("\n");
+}
+
+function renderToolChoiceInstruction(toolChoice: ToolChoice): string {
+  if (toolChoice === "none") {
+    return "You must answer directly and must not call any tool.";
+  }
+
+  if (toolChoice === "required") {
+    return "You must return at least one tool call.";
+  }
+
+  if (toolChoice === "auto") {
+    return "You may answer directly or call tool(s) if needed.";
+  }
+
+  return `You must call exactly one function named ${toolChoice.function.name}.`;
+}
+
+function parseJsonObject(text: string): Record<string, unknown> | null {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+    return typeof parsed === "object" && parsed !== null ? (parsed as Record<string, unknown>) : null;
+  } catch {
+    const firstBrace = trimmed.indexOf("{");
+    const lastBrace = trimmed.lastIndexOf("}");
+    if (firstBrace === -1 || lastBrace === -1 || lastBrace < firstBrace) {
+      return null;
+    }
+
+    try {
+      const parsed = JSON.parse(trimmed.slice(firstBrace, lastBrace + 1)) as unknown;
+      return typeof parsed === "object" && parsed !== null ? (parsed as Record<string, unknown>) : null;
+    } catch {
+      return null;
+    }
+  }
+}

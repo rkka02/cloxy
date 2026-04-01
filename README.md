@@ -9,6 +9,7 @@ The first MVP goal is narrow on purpose:
 - expose `/v1/responses`
 - support `stream: true`
 - map OpenAI-style requests to local CLI calls
+- support OpenAI-style function tool calls for external agent services
 
 This project does not try to perfectly emulate every OpenAI endpoint. It focuses on making existing coding tools talk to a local CLI backend with the smallest useful compatibility surface.
 
@@ -222,7 +223,10 @@ curl http://127.0.0.1:4141/v1/responses \
 
 - `/v1/chat/completions` and `/v1/responses` are implemented in this MVP.
 - `/v1/responses` currently supports text and image input only.
-- Tool calling and embeddings are not implemented yet.
+- Only `function` tools are supported.
+- Cloxy emits tool-call responses, but external callers still execute the tools themselves and send tool results back on the next turn.
+- Backend-native tool use is separate from this OpenAI-style tool-call layer.
+- Embeddings are not implemented yet.
 - Session persistence is opt-in and header-based rather than automatic OpenAI conversation storage.
 - Codex emits machine-readable events, but token-by-token output was not available in the tested command path, so streaming compatibility is coarse.
 - Gemini currently supports text-only requests in Cloxy even though the underlying CLI may evolve further.

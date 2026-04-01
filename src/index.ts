@@ -16,15 +16,20 @@ import {
   createCompletionId,
   createResponseId,
   formatChatCompletion,
+  formatChatToolCompletion,
   formatResponseCompleted,
   formatResponseCreated,
   formatResponseObject,
+  formatResponseToolObject,
   formatChatStreamChunk,
   hasImageParts,
   normalizeChatMessages,
   normalizeResponsesInput,
+  normalizeTools,
   nowSeconds,
+  parseToolPlannerResult,
   prependInstructions,
+  renderToolPlanningPrompt,
   toModelAlias
 } from "./openai";
 import { CloxyHttpError, isCloxyHttpError, UnsupportedFeatureError } from "./errors";
@@ -39,15 +44,32 @@ interface SessionRequest {
 const contentPartSchema = z.object({ type: z.string() }).passthrough();
 const messageSchema = z.object({
   role: z.enum(["system", "user", "assistant", "tool"]),
-  content: z.union([z.string(), z.array(contentPartSchema)]),
-  name: z.string().optional()
+  content: z.union([z.string(), z.array(contentPartSchema), z.null()]),
+  name: z.string().optional(),
+  tool_call_id: z.string().optional(),
+  tool_calls: z
+    .array(
+      z.object({
+        id: z.string().optional(),
+        type: z.string().optional(),
+        function: z
+          .object({
+            name: z.string().optional(),
+            arguments: z.string().optional()
+          })
+          .optional()
+      })
+    )
+    .optional()
 });
 
 const chatCompletionSchema = z.object({
   model: z.string(),
   messages: z.array(messageSchema).min(1),
   stream: z.boolean().optional(),
-  user: z.string().optional()
+  user: z.string().optional(),
+  tools: z.array(z.unknown()).optional(),
+  tool_choice: z.unknown().optional()
 });
 
 const responsesInputItemSchema = z.object({
@@ -56,14 +78,20 @@ const responsesInputItemSchema = z.object({
   content: z.unknown().optional(),
   text: z.string().optional(),
   image_url: z.unknown().optional(),
-  detail: z.unknown().optional()
+  detail: z.unknown().optional(),
+  call_id: z.unknown().optional(),
+  name: z.unknown().optional(),
+  arguments: z.unknown().optional(),
+  output: z.unknown().optional()
 });
 
 const responsesSchema = z.object({
   model: z.string(),
   input: z.union([z.string(), z.array(responsesInputItemSchema)]),
   instructions: z.string().optional(),
-  stream: z.boolean().optional()
+  stream: z.boolean().optional(),
+  tools: z.array(z.unknown()).optional(),
+  tool_choice: z.unknown().optional()
 });
 
 const config = loadConfig();
@@ -132,6 +160,7 @@ server.post("/v1/chat/completions", async (request, reply) => {
   const backend = resolveBackend(body.model, config.defaultBackend);
   const adapter = adapters[backend];
   const messages = normalizeChatMessages(body.messages);
+  const toolConfig = normalizeTools(body.tools, body.tool_choice);
   const session = parseSessionHeaders(request.headers);
   const workingDirectory = resolveWorkingDirectory(
     getHeaderValue(request.headers["x-cloxy-working-directory"]),
@@ -142,15 +171,82 @@ server.post("/v1/chat/completions", async (request, reply) => {
 
   if (body.stream) {
     const completionId = createCompletionId();
-    let streamStarted = false;
     let responseSessionId = session.sessionId;
 
-    const startChatStream = () => {
-      if (streamStarted) {
-        return;
+    reply.hijack();
+    try {
+      if (toolConfig.tools.length) {
+        const result = await adapter.complete({
+          messages: buildBackendMessages(messages, toolConfig, adapter.backend),
+          cwd: workingDirectory,
+          persistSession: session.mode === "persist",
+          sessionId: session.sessionId
+        });
+        responseSessionId = result.sessionId ?? responseSessionId;
+
+        reply.raw.writeHead(200, {
+          "Content-Type": "text/event-stream; charset=utf-8",
+          "Cache-Control": "no-cache, no-transform",
+          Connection: "keep-alive",
+          ...buildSessionHeaders(session.mode, responseSessionId)
+        });
+        reply.raw.write(
+          encodeSse(
+            formatChatStreamChunk(completionId, body.model, {
+              role: "assistant",
+              cloxy: {
+                session_mode: session.mode,
+                ...(responseSessionId ? { session_id: responseSessionId } : {})
+              }
+            })
+          )
+        );
+
+        const toolResult = parseToolPlannerResult(result.text, {
+          toolChoice: toolConfig.toolChoice,
+          tools: toolConfig.tools
+        });
+
+        if (toolResult.type === "tool_calls") {
+          toolResult.toolCalls.forEach((toolCall, index) => {
+            reply.raw.write(
+              encodeSse(
+                formatChatStreamChunk(completionId, body.model, {
+                  tool_calls: [
+                    {
+                      index,
+                      id: toolCall.id,
+                      type: "function",
+                      function: {
+                        name: toolCall.function.name,
+                        arguments: toolCall.function.arguments
+                      }
+                    }
+                  ]
+                })
+              )
+            );
+          });
+          reply.raw.write(
+            encodeSse(formatChatStreamChunk(completionId, body.model, {}, "tool_calls"))
+          );
+        } else {
+          reply.raw.write(
+            encodeSse(
+              formatChatStreamChunk(completionId, body.model, {
+                content: toolResult.content
+              })
+            )
+          );
+          reply.raw.write(
+            encodeSse(formatChatStreamChunk(completionId, body.model, {}, "stop"))
+          );
+        }
+
+        reply.raw.write("data: [DONE]\n\n");
+        return reply;
       }
 
-      reply.hijack();
       reply.raw.writeHead(200, {
         "Content-Type": "text/event-stream; charset=utf-8",
         "Cache-Control": "no-cache, no-transform",
@@ -168,10 +264,7 @@ server.post("/v1/chat/completions", async (request, reply) => {
           })
         )
       );
-      streamStarted = true;
-    };
 
-    try {
       for await (const event of adapter.stream({
         messages,
         cwd: workingDirectory,
@@ -182,8 +275,6 @@ server.post("/v1/chat/completions", async (request, reply) => {
           responseSessionId = event.sessionId;
           continue;
         }
-
-        startChatStream();
 
         if (event.type === "delta" && event.text) {
           reply.raw.write(
@@ -197,19 +288,12 @@ server.post("/v1/chat/completions", async (request, reply) => {
 
         if (event.type === "done") {
           reply.raw.write(
-            encodeSse(
-              formatChatStreamChunk(completionId, body.model, {}, "stop")
-            )
+            encodeSse(formatChatStreamChunk(completionId, body.model, {}, "stop"))
           );
           reply.raw.write("data: [DONE]\n\n");
         }
       }
-
-      if (!streamStarted) {
-        startChatStream();
-      }
     } catch (error) {
-      startChatStream();
       reply.raw.write(
         encodeSse({
           error: {
@@ -227,7 +311,7 @@ server.post("/v1/chat/completions", async (request, reply) => {
   }
 
   const result = await adapter.complete({
-    messages,
+    messages: buildBackendMessages(messages, toolConfig, adapter.backend),
     cwd: workingDirectory,
     persistSession: session.mode === "persist",
     sessionId: session.sessionId
@@ -235,6 +319,26 @@ server.post("/v1/chat/completions", async (request, reply) => {
 
   applySessionHeaders(reply, session.mode, result.sessionId);
   reply.code(200);
+
+  if (toolConfig.tools.length) {
+    const toolResult = parseToolPlannerResult(result.text, {
+      toolChoice: toolConfig.toolChoice,
+      tools: toolConfig.tools
+    });
+
+    if (toolResult.type === "tool_calls") {
+      return formatChatToolCompletion(body.model, toolResult.toolCalls, {
+        sessionMode: session.mode,
+        sessionId: result.sessionId
+      });
+    }
+
+    return formatChatCompletion(body.model, toolResult.content, {
+      sessionMode: session.mode,
+      sessionId: result.sessionId
+    });
+  }
+
   return formatChatCompletion(body.model, result.text, {
     sessionMode: session.mode,
     sessionId: result.sessionId
@@ -250,6 +354,7 @@ server.post("/v1/responses", async (request, reply) => {
     config.allowedRoots
   );
   const session = parseSessionHeaders(request.headers);
+  const toolConfig = normalizeTools(body.tools, body.tool_choice);
   const messages = prependInstructions(
     normalizeResponsesInput(body.input),
     body.instructions
@@ -260,16 +365,10 @@ server.post("/v1/responses", async (request, reply) => {
   if (body.stream) {
     const responseId = createResponseId();
     const messageId = createMessageId();
-    let fullText = "";
-    let streamStarted = false;
     let responseSessionId = session.sessionId;
+    reply.hijack();
 
-    const startResponsesStream = () => {
-      if (streamStarted) {
-        return;
-      }
-
-      reply.hijack();
+    try {
       reply.raw.writeHead(200, {
         "Content-Type": "text/event-stream; charset=utf-8",
         "Cache-Control": "no-cache, no-transform",
@@ -285,10 +384,103 @@ server.post("/v1/responses", async (request, reply) => {
           })
         })
       );
-      streamStarted = true;
-    };
 
-    try {
+      if (toolConfig.tools.length) {
+        const result = await adapter.complete({
+          messages: buildBackendMessages(messages, toolConfig, adapter.backend),
+          cwd: workingDirectory,
+          persistSession: session.mode === "persist",
+          sessionId: session.sessionId
+        });
+        responseSessionId = result.sessionId ?? responseSessionId;
+
+        const toolResult = parseToolPlannerResult(result.text, {
+          toolChoice: toolConfig.toolChoice,
+          tools: toolConfig.tools
+        });
+
+        if (toolResult.type === "tool_calls") {
+          toolResult.toolCalls.forEach((toolCall, outputIndex) => {
+            const item = {
+              id: createMessageId(),
+              type: "function_call",
+              status: "completed",
+              call_id: toolCall.id,
+              name: toolCall.function.name,
+              arguments: toolCall.function.arguments
+            };
+
+            reply.raw.write(
+              encodeSse({
+                type: "response.output_item.added",
+                response_id: responseId,
+                output_index: outputIndex,
+                item
+              })
+            );
+            reply.raw.write(
+              encodeSse({
+                type: "response.function_call_arguments.done",
+                response_id: responseId,
+                output_index: outputIndex,
+                item_id: item.id,
+                call_id: toolCall.id,
+                name: toolCall.function.name,
+                arguments: toolCall.function.arguments
+              })
+            );
+            reply.raw.write(
+              encodeSse({
+                type: "response.output_item.done",
+                response_id: responseId,
+                output_index: outputIndex,
+                item
+              })
+            );
+          });
+
+          reply.raw.write(
+            encodeSse({
+              type: "response.completed",
+              response: formatResponseToolObject(
+                body.model,
+                toolResult.toolCalls,
+                body.instructions,
+                {
+                  sessionMode: session.mode,
+                  sessionId: responseSessionId
+                }
+              )
+            })
+          );
+          reply.raw.write("data: [DONE]\n\n");
+          return reply;
+        }
+
+        reply.raw.write(
+          encodeSse({
+            type: "response.output_text.done",
+            response_id: responseId,
+            item_id: messageId,
+            output_index: 0,
+            content_index: 0,
+            text: toolResult.content
+          })
+        );
+        reply.raw.write(
+          encodeSse({
+            type: "response.completed",
+            response: formatResponseObject(body.model, toolResult.content, body.instructions, {
+              sessionMode: session.mode,
+              sessionId: responseSessionId
+            })
+          })
+        );
+        reply.raw.write("data: [DONE]\n\n");
+        return reply;
+      }
+
+      let fullText = "";
       for await (const event of adapter.stream({
         messages,
         cwd: workingDirectory,
@@ -299,8 +491,6 @@ server.post("/v1/responses", async (request, reply) => {
           responseSessionId = event.sessionId;
           continue;
         }
-
-        startResponsesStream();
 
         if (event.type === "delta" && event.text) {
           fullText += event.text;
@@ -346,12 +536,7 @@ server.post("/v1/responses", async (request, reply) => {
           reply.raw.write("data: [DONE]\n\n");
         }
       }
-
-      if (!streamStarted) {
-        startResponsesStream();
-      }
     } catch (error) {
-      startResponsesStream();
       reply.raw.write(
         encodeSse({
           type: "error",
@@ -370,7 +555,7 @@ server.post("/v1/responses", async (request, reply) => {
   }
 
   const result = await adapter.complete({
-    messages,
+    messages: buildBackendMessages(messages, toolConfig, adapter.backend),
     cwd: workingDirectory,
     persistSession: session.mode === "persist",
     sessionId: session.sessionId
@@ -378,6 +563,26 @@ server.post("/v1/responses", async (request, reply) => {
 
   applySessionHeaders(reply, session.mode, result.sessionId);
   reply.code(200);
+
+  if (toolConfig.tools.length) {
+    const toolResult = parseToolPlannerResult(result.text, {
+      toolChoice: toolConfig.toolChoice,
+      tools: toolConfig.tools
+    });
+
+    if (toolResult.type === "tool_calls") {
+      return formatResponseToolObject(body.model, toolResult.toolCalls, body.instructions, {
+        sessionMode: session.mode,
+        sessionId: result.sessionId
+      });
+    }
+
+    return formatResponseObject(body.model, toolResult.content, body.instructions, {
+      sessionMode: session.mode,
+      sessionId: result.sessionId
+    });
+  }
+
   return formatResponseObject(body.model, result.text, body.instructions, {
     sessionMode: session.mode,
     sessionId: result.sessionId
@@ -513,6 +718,33 @@ function isUuid(value: string): boolean {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
     value
   );
+}
+
+function buildBackendMessages(
+  messages: ReturnType<typeof normalizeChatMessages>,
+  toolConfig: ReturnType<typeof normalizeTools>,
+  backend: BackendName
+) {
+  if (toolConfig.tools.length === 0) {
+    return messages;
+  }
+
+  return [
+    {
+      role: "user" as const,
+      content: [
+        {
+          type: "text" as const,
+          text: renderToolPlanningPrompt({
+            messages,
+            tools: toolConfig.tools,
+            toolChoice: toolConfig.toolChoice,
+            includeImagePlaceholders: backend !== "claude"
+          })
+        }
+      ]
+    }
+  ];
 }
 
 function assertBackendCapabilities(

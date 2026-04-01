@@ -22,7 +22,7 @@ export class CodexAdapter implements BackendAdapter {
     text: true,
     imageInput: true,
     sessionPersistence: true,
-    tools: false,
+    tools: true,
     streaming: true
   } as const;
 

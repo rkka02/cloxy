@@ -16,6 +16,7 @@ MVP request translation deliberately stays simple:
 - support message content as plain strings
 - support content arrays with text and image parts
 - support `responses.instructions` as an injected system message
+- support OpenAI-style `function` tools through a Cloxy planning layer
 - accept `data:image/jpeg;base64,...` and `data:image/png;base64,...`
 - reject remote URLs and non-image binary inputs for now
 
@@ -24,6 +25,7 @@ Prompt rendering follows this shape:
 - combined system guidance block
 - normalized transcript of prior messages
 - explicit instruction to continue with the next assistant reply only
+- when tools are present, Cloxy swaps in a strict JSON planner prompt so the backend emits either assistant text or function call intents
 
 This keeps behavior predictable across both backends.
 
@@ -94,6 +96,6 @@ Image inputs are also guarded before backend handoff:
 ## Non-Goals For MVP
 
 - full OpenAI `/v1/responses` parity
-- assistant tool calling passthrough
+- backend-native tool invocation passthrough
 - embeddings
 - automatic workspace checkout or worktree management

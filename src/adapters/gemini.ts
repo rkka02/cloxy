@@ -38,7 +38,7 @@ export class GeminiAdapter implements BackendAdapter {
     text: true,
     imageInput: false,
     sessionPersistence: true,
-    tools: false,
+    tools: true,
     streaming: true
   } as const;
 
@@ -98,7 +98,7 @@ async function runGeminiProcess(
 
   const args = [
     "--approval-mode",
-    "plan",
+    "default",
     "-o",
     outputFormat,
     "-p",
