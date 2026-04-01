@@ -84,6 +84,13 @@ Image inputs are also guarded before backend handoff:
 - JSONL events are translated into a final assistant chunk for stream requests
 - on Windows, shim-style commands are launched through the shell so `.cmd` installs work
 
+### Gemini
+
+- command path uses `gemini -p ... -o json|stream-json --approval-mode plan`
+- stateless requests still create backend sessions internally, but Cloxy only exposes and resumes them when persistence is requested
+- current Cloxy integration is text-only
+- stream-json events are parsed from line-oriented JSON with an initial `init` event carrying the session ID
+
 ## Non-Goals For MVP
 
 - full OpenAI `/v1/responses` parity

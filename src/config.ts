@@ -1,6 +1,6 @@
 import path from "node:path";
 
-export type BackendName = "claude" | "codex";
+export type BackendName = "claude" | "codex" | "gemini";
 
 export interface CloxyConfig {
   host: string;
@@ -13,6 +13,8 @@ export interface CloxyConfig {
   codexBinary: string;
   codexSandbox: string;
   codexTimeoutMs: number;
+  geminiBinary: string;
+  geminiTimeoutMs: number;
 }
 
 function normalizeAbsolutePath(input: string): string {
@@ -44,7 +46,9 @@ export function loadConfig(): CloxyConfig {
     claudePermissionMode: process.env.CLOXY_CLAUDE_PERMISSION_MODE ?? "default",
     codexBinary: process.env.CLOXY_CODEX_BIN ?? "codex",
     codexSandbox: process.env.CLOXY_CODEX_SANDBOX ?? "read-only",
-    codexTimeoutMs: Number(process.env.CLOXY_CODEX_TIMEOUT_MS ?? "7200000")
+    codexTimeoutMs: Number(process.env.CLOXY_CODEX_TIMEOUT_MS ?? "7200000"),
+    geminiBinary: process.env.CLOXY_GEMINI_BIN ?? "gemini",
+    geminiTimeoutMs: Number(process.env.CLOXY_GEMINI_TIMEOUT_MS ?? "7200000")
   };
 
   return config;

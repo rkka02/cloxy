@@ -3,6 +3,7 @@ import { z } from "zod";
 import { ZodError } from "zod";
 import { ClaudeAdapter } from "./adapters/claude";
 import { CodexAdapter } from "./adapters/codex";
+import { GeminiAdapter } from "./adapters/gemini";
 import type { BackendAdapter } from "./adapters/types";
 import {
   loadConfig,
@@ -401,7 +402,8 @@ main().catch((error) => {
 function buildAdapters(config: CloxyConfig): Record<BackendName, BackendAdapter> {
   return {
     claude: new ClaudeAdapter(config),
-    codex: new CodexAdapter(config)
+    codex: new CodexAdapter(config),
+    gemini: new GeminiAdapter(config)
   };
 }
 
@@ -421,6 +423,13 @@ function listModels(adapters: Record<BackendName, BackendAdapter>): Array<Record
       created,
       owned_by: "cloxy",
       capabilities: adapters.codex.capabilities
+    },
+    {
+      id: "cloxy-gemini",
+      object: "model",
+      created,
+      owned_by: "cloxy",
+      capabilities: adapters.gemini.capabilities
     }
   ];
 }
@@ -432,6 +441,9 @@ function resolveBackend(input: string, fallback: BackendName): BackendName {
   }
   if (model.includes("codex")) {
     return "codex";
+  }
+  if (model.includes("gemini")) {
+    return "gemini";
   }
   return fallback;
 }

@@ -18,6 +18,7 @@ Current backend support:
 
 - `cloxy-claude`: recommended first backend, supports real streaming and image input
 - `cloxy-codex`: experimental, streams as chunked final text because Codex CLI exposes JSONL events but not token deltas in the tested path; image input is supported
+- `cloxy-gemini`: experimental, supports text input, stream-json parsing, and opt-in session resume; image input is not wired yet
 
 ## Why This Shape
 
@@ -62,6 +63,8 @@ Optional environment variables:
 - `CLOXY_CODEX_BIN`
 - `CLOXY_CODEX_SANDBOX`
 - `CLOXY_CODEX_TIMEOUT_MS`
+- `CLOXY_GEMINI_BIN`
+- `CLOXY_GEMINI_TIMEOUT_MS`
 
 ## Models
 
@@ -69,8 +72,9 @@ Optional environment variables:
 
 - `cloxy-claude`
 - `cloxy-codex`
+- `cloxy-gemini`
 
-The proxy also accepts simple aliases such as `claude` and `codex`.
+The proxy also accepts simple aliases such as `claude`, `codex`, and `gemini`.
 
 Each model object also includes a `capabilities` block describing support for:
 
@@ -221,6 +225,7 @@ curl http://127.0.0.1:4141/v1/responses \
 - Tool calling and embeddings are not implemented yet.
 - Session persistence is opt-in and header-based rather than automatic OpenAI conversation storage.
 - Codex emits machine-readable events, but token-by-token output was not available in the tested command path, so streaming compatibility is coarse.
+- Gemini currently supports text-only requests in Cloxy even though the underlying CLI may evolve further.
 - The "fixed cost" thesis only makes sense when the underlying CLI is authenticated in subscription-backed mode rather than API-key billing mode.
 - Only `data:image/jpeg;base64,...` and `data:image/png;base64,...` inputs are accepted right now.
 - Image inputs are limited to 10 MiB per image, 40 MiB total, and 16 images per request.
