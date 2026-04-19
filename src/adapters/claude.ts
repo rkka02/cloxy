@@ -106,6 +106,7 @@ async function* runClaudeQuery(
       cwd: params.cwd,
       includePartialMessages,
       maxTurns,
+      ...(params.model ? { model: params.model } : {}),
       pathToClaudeCodeExecutable: config.claudeBinary,
       permissionMode: permissionMode as PermissionMode,
       allowDangerouslySkipPermissions: permissionMode === "bypassPermissions",

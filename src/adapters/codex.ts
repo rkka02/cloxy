@@ -5,6 +5,7 @@ import type { CloxyConfig } from "../config";
 import { renderTranscript } from "../openai";
 import type {
   BackendAdapter,
+  CodexReasoningEffort,
   CodexSandboxMode,
   CompletionParams,
   CompletionResult,
@@ -73,11 +74,14 @@ async function runCodexProcess(
   const imageTempDir = await createImageTempDir(params);
   const sandbox = params.codexSandbox ?? (config.codexSandbox as CodexSandboxMode);
   const resumeModeArgs = buildResumeModeArgs(sandbox);
+  const reasoningArgs = buildReasoningArgs(params.codexReasoningEffort);
   const args = params.sessionId
     ? [
         "exec",
         "resume",
         "--json",
+        ...(params.model ? ["--model", params.model] : []),
+        ...reasoningArgs,
         "--skip-git-repo-check",
         ...resumeModeArgs,
         ...imageTempDir.args,
@@ -88,6 +92,8 @@ async function runCodexProcess(
         "exec",
         "--skip-git-repo-check",
         "--json",
+        ...(params.model ? ["--model", params.model] : []),
+        ...reasoningArgs,
         ...buildExecModeArgs(sandbox, params.persistSession),
         ...imageTempDir.args,
         "-"
@@ -194,6 +200,16 @@ function buildResumeModeArgs(codexSandbox: string): string[] {
   }
 
   return [];
+}
+
+function buildReasoningArgs(
+  reasoningEffort: CodexReasoningEffort | undefined
+): string[] {
+  if (!reasoningEffort) {
+    return [];
+  }
+
+  return ["-c", `model_reasoning_effort="${reasoningEffort}"`];
 }
 
 function buildExecModeArgs(

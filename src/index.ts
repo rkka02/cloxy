@@ -8,12 +8,14 @@ import { GeminiAdapter } from "./adapters/gemini";
 import type {
   BackendAdapter,
   ClaudePermissionMode,
+  CodexReasoningEffort,
   CodexSandboxMode,
   GeminiApprovalMode
 } from "./adapters/types";
 import {
   loadConfig,
   resolveWorkingDirectory,
+  type AdvertisedModel,
   type BackendName,
   type CloxyConfig
 } from "./config";
@@ -47,6 +49,11 @@ interface SessionRequest {
   sessionId?: string;
 }
 
+interface ResolvedModel {
+  backend: BackendName;
+  backendModel?: string;
+}
+
 const contentPartSchema = z.object({ type: z.string() }).passthrough();
 const workspacePermissionsSchema = z.object({
   read: z.boolean().optional(),
@@ -58,6 +65,9 @@ const workspaceSchema = z.object({
   cwd: z.string().optional(),
   permissionMode: z.string().optional(),
   permissions: workspacePermissionsSchema.optional()
+});
+const reasoningSchema = z.object({
+  effort: z.string().optional()
 });
 const messageSchema = z.object({
   role: z.enum(["system", "user", "assistant", "tool"]),
@@ -91,6 +101,8 @@ const chatCompletionSchema = z.object({
   cwd: z.string().optional(),
   workspace_root: z.string().optional(),
   permission_mode: z.string().optional(),
+  reasoning: reasoningSchema.optional(),
+  reasoning_effort: z.string().optional(),
   permissions: workspacePermissionsSchema.optional(),
   dangerously_skip_permissions: z.boolean().optional()
 });
@@ -119,6 +131,8 @@ const responsesSchema = z.object({
   cwd: z.string().optional(),
   workspace_root: z.string().optional(),
   permission_mode: z.string().optional(),
+  reasoning: reasoningSchema.optional(),
+  reasoning_effort: z.string().optional(),
   permissions: workspacePermissionsSchema.optional(),
   dangerously_skip_permissions: z.boolean().optional()
 });
@@ -165,7 +179,7 @@ server.get("/", async () => {
   return {
     name: "cloxy",
     object: "service",
-    models: listModels(adapters),
+    models: listModels(config.models, adapters),
     default_backend: config.defaultBackend
   };
 });
@@ -180,14 +194,14 @@ server.get("/health", async () => {
 server.get("/v1/models", async () => {
   return {
     object: "list",
-    data: listModels(adapters)
+    data: listModels(config.models, adapters)
   };
 });
 
 server.post("/v1/chat/completions", async (request, reply) => {
   const body = chatCompletionSchema.parse(request.body);
-  const backend = resolveBackend(body.model, config.defaultBackend);
-  const adapter = adapters[backend];
+  const resolvedModel = resolveRequestedModel(body.model, config);
+  const adapter = adapters[resolvedModel.backend];
   const messages = normalizeChatMessages(body.messages);
   const toolConfig = normalizeTools(body.tools, body.tool_choice);
   const session = parseSessionHeaders(request.headers);
@@ -197,6 +211,7 @@ server.post("/v1/chat/completions", async (request, reply) => {
     mergeAllowedRoots(config.allowedRoots, requestWorkspaceRoot)
   );
   const codexSandbox = resolveRequestedCodexSandbox(body, config.codexSandbox);
+  const codexReasoningEffort = resolveRequestedCodexReasoningEffort(body);
   const claudePermissionMode = resolveRequestedClaudePermissionMode(body, config.claudePermissionMode);
   const geminiApprovalMode = resolveRequestedGeminiApprovalMode(body);
 
@@ -211,8 +226,10 @@ server.post("/v1/chat/completions", async (request, reply) => {
       if (toolConfig.tools.length) {
         const result = await adapter.complete({
           messages: buildBackendMessages(messages, toolConfig, adapter.backend),
+          model: resolvedModel.backendModel,
           cwd: workingDirectory,
           codexSandbox,
+          codexReasoningEffort,
           claudePermissionMode,
           geminiApprovalMode,
           persistSession: session.mode === "persist",
@@ -305,8 +322,10 @@ server.post("/v1/chat/completions", async (request, reply) => {
 
       for await (const event of adapter.stream({
         messages,
+        model: resolvedModel.backendModel,
         cwd: workingDirectory,
         codexSandbox,
+        codexReasoningEffort,
         claudePermissionMode,
         geminiApprovalMode,
         persistSession: session.mode === "persist",
@@ -353,8 +372,10 @@ server.post("/v1/chat/completions", async (request, reply) => {
 
   const result = await adapter.complete({
     messages: buildBackendMessages(messages, toolConfig, adapter.backend),
+    model: resolvedModel.backendModel,
     cwd: workingDirectory,
     codexSandbox,
+    codexReasoningEffort,
     claudePermissionMode,
     geminiApprovalMode,
     persistSession: session.mode === "persist",
@@ -392,8 +413,8 @@ server.post("/v1/chat/completions", async (request, reply) => {
 
 server.post("/v1/responses", async (request, reply) => {
   const body = responsesSchema.parse(request.body);
-  const backend = resolveBackend(body.model, config.defaultBackend);
-  const adapter = adapters[backend];
+  const resolvedModel = resolveRequestedModel(body.model, config);
+  const adapter = adapters[resolvedModel.backend];
   const requestWorkspaceRoot = getRequestedWorkspaceRoot(body);
   const workingDirectory = resolveWorkingDirectory(
     getRequestedWorkingDirectory(request.headers, body),
@@ -402,6 +423,7 @@ server.post("/v1/responses", async (request, reply) => {
   const session = parseSessionHeaders(request.headers);
   const toolConfig = normalizeTools(body.tools, body.tool_choice);
   const codexSandbox = resolveRequestedCodexSandbox(body, config.codexSandbox);
+  const codexReasoningEffort = resolveRequestedCodexReasoningEffort(body);
   const claudePermissionMode = resolveRequestedClaudePermissionMode(body, config.claudePermissionMode);
   const geminiApprovalMode = resolveRequestedGeminiApprovalMode(body);
   const messages = prependInstructions(
@@ -438,8 +460,10 @@ server.post("/v1/responses", async (request, reply) => {
       if (toolConfig.tools.length) {
         const result = await adapter.complete({
           messages: buildBackendMessages(messages, toolConfig, adapter.backend),
+          model: resolvedModel.backendModel,
           cwd: workingDirectory,
           codexSandbox,
+          codexReasoningEffort,
           claudePermissionMode,
           geminiApprovalMode,
           persistSession: session.mode === "persist",
@@ -536,8 +560,10 @@ server.post("/v1/responses", async (request, reply) => {
       let fullText = "";
       for await (const event of adapter.stream({
         messages,
+        model: resolvedModel.backendModel,
         cwd: workingDirectory,
         codexSandbox,
+        codexReasoningEffort,
         claudePermissionMode,
         geminiApprovalMode,
         persistSession: session.mode === "persist",
@@ -612,8 +638,10 @@ server.post("/v1/responses", async (request, reply) => {
 
   const result = await adapter.complete({
     messages: buildBackendMessages(messages, toolConfig, adapter.backend),
+    model: resolvedModel.backendModel,
     cwd: workingDirectory,
     codexSandbox,
+    codexReasoningEffort,
     claudePermissionMode,
     geminiApprovalMode,
     persistSession: session.mode === "persist",
@@ -672,48 +700,58 @@ function buildAdapters(config: CloxyConfig): Record<BackendName, BackendAdapter>
   };
 }
 
-function listModels(adapters: Record<BackendName, BackendAdapter>): Array<Record<string, unknown>> {
+function listModels(
+  models: AdvertisedModel[],
+  adapters: Record<BackendName, BackendAdapter>
+): Array<Record<string, unknown>> {
   const created = nowSeconds();
-  return [
-    {
-      id: "cloxy-claude",
-      object: "model",
-      created,
-      owned_by: "cloxy",
-      usage_policy: adapters.claude.usagePolicy,
-      capabilities: adapters.claude.capabilities
-    },
-    {
-      id: "cloxy-codex",
-      object: "model",
-      created,
-      owned_by: "cloxy",
-      usage_policy: adapters.codex.usagePolicy,
-      capabilities: adapters.codex.capabilities
-    },
-    {
-      id: "cloxy-gemini",
-      object: "model",
-      created,
-      owned_by: "cloxy",
-      usage_policy: adapters.gemini.usagePolicy,
-      capabilities: adapters.gemini.capabilities
-    }
-  ];
+  return models.map((model) => ({
+    id: model.id,
+    object: "model",
+    created,
+    owned_by: "cloxy",
+    backend: model.backend,
+    ...(model.backendModel ? { backend_model: model.backendModel } : {}),
+    usage_policy: adapters[model.backend].usagePolicy,
+    capabilities: adapters[model.backend].capabilities
+  }));
 }
 
-function resolveBackend(input: string, fallback: BackendName): BackendName {
-  const model = toModelAlias(input);
-  if (model.includes("claude")) {
-    return "claude";
+function resolveRequestedModel(input: string, config: CloxyConfig): ResolvedModel {
+  const requestedId = input.trim();
+  const advertised = config.models.find((candidate) => candidate.id === requestedId);
+  if (advertised) {
+    return {
+      backend: advertised.backend,
+      backendModel: advertised.backendModel
+    };
   }
-  if (model.includes("codex")) {
-    return "codex";
+
+  const alias = toModelAlias(requestedId);
+  if (alias.includes("claude") || alias === "sonnet" || alias === "opus" || alias === "haiku") {
+    return {
+      backend: "claude",
+      backendModel: requestedId
+    };
   }
-  if (model.includes("gemini")) {
-    return "gemini";
+
+  if (alias.includes("gemini")) {
+    return {
+      backend: "gemini",
+      backendModel: requestedId
+    };
   }
-  return fallback;
+
+  if (alias.includes("gpt") || alias.includes("codex") || /^o[1-9]/.test(alias)) {
+    return {
+      backend: "codex",
+      backendModel: requestedId
+    };
+  }
+
+  return {
+    backend: config.defaultBackend
+  };
 }
 
 function encodeSse(payload: Record<string, unknown>): string {
@@ -914,6 +952,31 @@ function resolveRequestedCodexSandbox(
   return "read-only";
 }
 
+function resolveRequestedCodexReasoningEffort(
+  body: {
+    reasoning?: {
+      effort?: string;
+    };
+    reasoning_effort?: string;
+  }
+): CodexReasoningEffort | undefined {
+  const requestedEffort = firstNonEmptyString(
+    body.reasoning?.effort,
+    body.reasoning_effort
+  );
+
+  if (
+    requestedEffort === "low" ||
+    requestedEffort === "medium" ||
+    requestedEffort === "high" ||
+    requestedEffort === "xhigh"
+  ) {
+    return requestedEffort;
+  }
+
+  return undefined;
+}
+
 function resolveRequestedClaudePermissionMode(
   body: {
     workspace?: {
@@ -991,11 +1054,19 @@ function resolveRequestedGeminiApprovalMode(
     return "yolo";
   }
 
-  if (writeEnabled === true) {
+  if (
+    writeEnabled === true ||
+    requestedPermissionMode === "auto_edit" ||
+    requestedPermissionMode === "acceptEdits"
+  ) {
     return "auto_edit";
   }
 
-  return "plan";
+  if (requestedPermissionMode === "plan") {
+    return "plan";
+  }
+
+  return "default";
 }
 
 function firstNonEmptyString(...values: Array<string | undefined>): string | undefined {

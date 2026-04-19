@@ -2,16 +2,19 @@ import type { BackendName } from "../config";
 import type { ConversationMessage } from "../openai";
 
 export type CodexSandboxMode = "read-only" | "workspace-write" | "danger-full-access";
+export type CodexReasoningEffort = "low" | "medium" | "high" | "xhigh";
 export type ClaudePermissionMode = "default" | "acceptEdits" | "bypassPermissions" | "plan" | "dontAsk";
 export type GeminiApprovalMode = "default" | "auto_edit" | "yolo" | "plan";
 export type BackendUsagePolicy = "general" | "private-use-only";
 
 export interface CompletionParams {
   messages: ConversationMessage[];
+  model?: string;
   cwd: string;
   persistSession: boolean;
   sessionId?: string;
   codexSandbox?: CodexSandboxMode;
+  codexReasoningEffort?: CodexReasoningEffort;
   claudePermissionMode?: ClaudePermissionMode;
   geminiApprovalMode?: GeminiApprovalMode;
 }

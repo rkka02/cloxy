@@ -61,21 +61,56 @@ Optional environment variables:
 - `CLOXY_ALLOWED_ROOTS`
 - `CLOXY_CLAUDE_BIN`
 - `CLOXY_CLAUDE_PERMISSION_MODE`
+- `CLOXY_CLAUDE_MODELS`
 - `CLOXY_CODEX_BIN`
 - `CLOXY_CODEX_SANDBOX`
 - `CLOXY_CODEX_TIMEOUT_MS`
+- `CLOXY_CODEX_MODELS`
 - `CLOXY_GEMINI_BIN`
+- `CLOXY_GEMINI_DEFAULT_MODEL`
+- `CLOXY_GEMINI_FALLBACK_MODEL`
 - `CLOXY_GEMINI_TIMEOUT_MS`
+- `CLOXY_GEMINI_MODELS`
 
 ## Models
 
 `GET /v1/models` returns:
 
 - `cloxy-claude`
+- `claude`
+- `sonnet`
+- `opus`
 - `cloxy-codex`
+- `codex`
+- `gpt-5`
+- `gpt-5-codex`
 - `cloxy-gemini`
+- `gemini`
+- `gemini-3.1-pro-preview`
+- `gemini-3-flash-preview`
 
-The proxy also accepts simple aliases such as `claude`, `codex`, and `gemini`.
+Exact IDs returned by `/v1/models` are routed first. If you send another model name such as a full provider-specific ID, Cloxy falls back to backend heuristics and passes that model through to the underlying CLI when possible.
+
+Each model object includes:
+
+- `backend`
+- optional `backend_model`
+- `capabilities`
+- `usage_policy`
+
+You can override the advertised model catalog per backend with comma-separated env vars:
+
+- `CLOXY_CLAUDE_MODELS=cloxy-claude,claude,sonnet=sonnet,opus=opus`
+- `CLOXY_CODEX_MODELS=cloxy-codex,codex,gpt-5=gpt-5,gpt-5-codex=gpt-5-codex`
+- `CLOXY_GEMINI_MODELS=cloxy-gemini=gemini-3.1-pro-preview,gemini=gemini-3.1-pro-preview,gemini-3.1-pro-preview=gemini-3.1-pro-preview,gemini-3-flash-preview=gemini-3-flash-preview`
+
+Gemini defaults:
+
+- `cloxy-gemini` and `gemini` resolve to `gemini-3.1-pro-preview`
+- if Gemini returns a quota or capacity error on that default model, Cloxy retries once with `gemini-3-flash-preview`
+- override with `CLOXY_GEMINI_DEFAULT_MODEL` and `CLOXY_GEMINI_FALLBACK_MODEL`
+
+Entries use `public-id=backend-model`. If `=backend-model` is omitted, Cloxy only chooses the backend and lets that CLI use its configured default model.
 
 Each model object also includes a `capabilities` block describing support for:
 

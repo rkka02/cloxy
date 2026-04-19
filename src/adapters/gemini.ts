@@ -94,14 +94,49 @@ async function runGeminiProcess(
   sessionId?: string;
   error?: GeminiJsonResult["error"];
 }> {
+  const selectedModel = params.model ?? config.geminiDefaultModel;
+  const fallbackModel =
+    config.geminiFallbackModel &&
+    config.geminiFallbackModel !== selectedModel &&
+    selectedModel === config.geminiDefaultModel
+      ? config.geminiFallbackModel
+      : undefined;
+
+  try {
+    const output = await runGeminiAttempt(config, params, outputFormat, selectedModel);
+    if (output.error && fallbackModel && isGeminiQuotaError(output.error)) {
+      return runGeminiAttempt(config, params, outputFormat, fallbackModel);
+    }
+
+    return output;
+  } catch (error) {
+    if (fallbackModel && isGeminiQuotaError(error)) {
+      return runGeminiAttempt(config, params, outputFormat, fallbackModel);
+    }
+
+    throw error;
+  }
+}
+
+async function runGeminiAttempt(
+  config: CloxyConfig,
+  params: CompletionParams,
+  outputFormat: "json" | "stream-json",
+  model: string
+): Promise<{
+  text?: string;
+  sessionId?: string;
+  error?: GeminiJsonResult["error"];
+}> {
   const prompt = renderTranscript(params.messages, {
     includeImagePlaceholders: false
   });
-  const approvalMode = params.geminiApprovalMode ?? "plan";
+  const approvalMode = params.geminiApprovalMode ?? "default";
 
   const args = [
-    "--approval-mode",
-    approvalMode,
+    ...(approvalMode !== "default" ? ["--approval-mode", approvalMode] : []),
+    "-m",
+    model,
     "-o",
     outputFormat,
     "-p",
@@ -236,7 +271,7 @@ function normalizeGeminiError(error: GeminiJsonResult["error"]): Error {
   const message = error?.message?.trim() || "Gemini request failed.";
   const lower = message.toLowerCase();
 
-  if (lower.includes("resource_exhausted") || lower.includes("no capacity available")) {
+  if (isGeminiQuotaLikeMessage(lower)) {
     return new CloxyHttpError(message, 429, "rate_limit_exceeded");
   }
 
@@ -245,4 +280,33 @@ function normalizeGeminiError(error: GeminiJsonResult["error"]): Error {
   }
 
   return new Error(message);
+}
+
+function isGeminiQuotaError(error: unknown): boolean {
+  if (error instanceof CloxyHttpError) {
+    return error.statusCode === 429;
+  }
+
+  if (error instanceof Error) {
+    return isGeminiQuotaLikeMessage(error.message.toLowerCase());
+  }
+
+  if (error && typeof error === "object") {
+    const message =
+      "message" in error && typeof error.message === "string"
+        ? error.message
+        : "";
+    return isGeminiQuotaLikeMessage(message.toLowerCase());
+  }
+
+  return false;
+}
+
+function isGeminiQuotaLikeMessage(message: string): boolean {
+  return (
+    message.includes("resource_exhausted") ||
+    message.includes("no capacity available") ||
+    message.includes("quota") ||
+    message.includes("rate limit")
+  );
 }
