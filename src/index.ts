@@ -47,7 +47,17 @@ interface SessionRequest {
   sessionId?: string;
 }
 
+interface CodexModelSelection {
+  model?: string;
+  reasoningEffort?: string;
+}
+
+const backendSchema = z.enum(["claude", "codex", "gemini"]);
 const contentPartSchema = z.object({ type: z.string() }).passthrough();
+const envSchema = z.record(z.string(), z.string());
+const streamOptionsSchema = z.object({
+  include_usage: z.boolean().optional()
+});
 const workspacePermissionsSchema = z.object({
   read: z.boolean().optional(),
   write: z.boolean().optional(),
@@ -57,7 +67,9 @@ const workspaceSchema = z.object({
   rootDir: z.string().optional(),
   cwd: z.string().optional(),
   permissionMode: z.string().optional(),
-  permissions: workspacePermissionsSchema.optional()
+  permissions: workspacePermissionsSchema.optional(),
+  env: envSchema.optional(),
+  additional_directories: z.array(z.string()).optional()
 });
 const messageSchema = z.object({
   role: z.enum(["system", "user", "assistant", "tool"]),
@@ -82,14 +94,22 @@ const messageSchema = z.object({
 
 const chatCompletionSchema = z.object({
   model: z.string(),
+  backend: backendSchema.optional(),
   messages: z.array(messageSchema).min(1),
   stream: z.boolean().optional(),
+  stream_options: streamOptionsSchema.optional(),
   user: z.string().optional(),
   tools: z.array(z.unknown()).optional(),
   tool_choice: z.unknown().optional(),
   workspace: workspaceSchema.optional(),
   cwd: z.string().optional(),
   workspace_root: z.string().optional(),
+  env: envSchema.optional(),
+  additional_directories: z.array(z.string()).optional(),
+  reasoning_effort: z.string().optional(),
+  codex_search: z.boolean().optional(),
+  codex_fast_mode: z.boolean().optional(),
+  max_turns: z.number().int().positive().optional(),
   permission_mode: z.string().optional(),
   permissions: workspacePermissionsSchema.optional(),
   dangerously_skip_permissions: z.boolean().optional()
@@ -110,14 +130,22 @@ const responsesInputItemSchema = z.object({
 
 const responsesSchema = z.object({
   model: z.string(),
+  backend: backendSchema.optional(),
   input: z.union([z.string(), z.array(responsesInputItemSchema)]),
   instructions: z.string().optional(),
   stream: z.boolean().optional(),
+  stream_options: streamOptionsSchema.optional(),
   tools: z.array(z.unknown()).optional(),
   tool_choice: z.unknown().optional(),
   workspace: workspaceSchema.optional(),
   cwd: z.string().optional(),
   workspace_root: z.string().optional(),
+  env: envSchema.optional(),
+  additional_directories: z.array(z.string()).optional(),
+  reasoning_effort: z.string().optional(),
+  codex_search: z.boolean().optional(),
+  codex_fast_mode: z.boolean().optional(),
+  max_turns: z.number().int().positive().optional(),
   permission_mode: z.string().optional(),
   permissions: workspacePermissionsSchema.optional(),
   dangerously_skip_permissions: z.boolean().optional()
@@ -186,11 +214,12 @@ server.get("/v1/models", async () => {
 
 server.post("/v1/chat/completions", async (request, reply) => {
   const body = chatCompletionSchema.parse(request.body);
-  const backend = resolveBackend(body.model, config.defaultBackend);
+  const backend = resolveBackend(body.model, config.defaultBackend, body.backend);
   const adapter = adapters[backend];
   const messages = normalizeChatMessages(body.messages);
   const toolConfig = normalizeTools(body.tools, body.tool_choice);
   const session = parseSessionHeaders(request.headers);
+  const codexSelection = resolveRequestedCodexModelSelection(request.headers);
   const requestWorkspaceRoot = getRequestedWorkspaceRoot(body);
   const workingDirectory = resolveWorkingDirectory(
     getRequestedWorkingDirectory(request.headers, body),
@@ -199,6 +228,14 @@ server.post("/v1/chat/completions", async (request, reply) => {
   const codexSandbox = resolveRequestedCodexSandbox(body, config.codexSandbox);
   const claudePermissionMode = resolveRequestedClaudePermissionMode(body, config.claudePermissionMode);
   const geminiApprovalMode = resolveRequestedGeminiApprovalMode(body);
+  const requestedModel = resolveRequestedModel(backend, body.model, codexSelection.model);
+  const reasoningEffort = resolveRequestedReasoningEffort(
+    body.reasoning_effort,
+    codexSelection.reasoningEffort
+  );
+  const requestedEnv = resolveRequestedEnv(body);
+  const additionalDirectories = resolveRequestedAdditionalDirectories(body);
+  const includeUsage = body.stream_options?.include_usage === true;
 
   assertBackendCapabilities(adapter, messages, body.stream === true);
 
@@ -212,6 +249,13 @@ server.post("/v1/chat/completions", async (request, reply) => {
         const result = await adapter.complete({
           messages: buildBackendMessages(messages, toolConfig, adapter.backend),
           cwd: workingDirectory,
+          model: requestedModel,
+          reasoningEffort,
+          maxTurns: body.max_turns,
+          env: requestedEnv,
+          additionalDirectories,
+          codexSearch: body.codex_search,
+          codexFastMode: body.codex_fast_mode,
           codexSandbox,
           claudePermissionMode,
           geminiApprovalMode,
@@ -229,13 +273,16 @@ server.post("/v1/chat/completions", async (request, reply) => {
         });
         reply.raw.write(
           encodeSse(
-            formatChatStreamChunk(completionId, body.model, {
-              role: "assistant",
-              cloxy: {
-                session_mode: session.mode,
-                ...(responseSessionId ? { session_id: responseSessionId } : {})
+            formatChatStreamChunk(
+              completionId,
+              body.model,
+              { role: "assistant" },
+              null,
+              {
+                sessionMode: session.mode,
+                sessionId: responseSessionId
               }
-            })
+            )
           )
         );
 
@@ -265,7 +312,13 @@ server.post("/v1/chat/completions", async (request, reply) => {
             );
           });
           reply.raw.write(
-            encodeSse(formatChatStreamChunk(completionId, body.model, {}, "tool_calls"))
+            encodeSse(
+              formatChatStreamChunk(completionId, body.model, {}, "tool_calls", {
+                sessionMode: session.mode,
+                sessionId: responseSessionId,
+                usage: includeUsage ? result.usage : undefined
+              })
+            )
           );
         } else {
           reply.raw.write(
@@ -276,7 +329,13 @@ server.post("/v1/chat/completions", async (request, reply) => {
             )
           );
           reply.raw.write(
-            encodeSse(formatChatStreamChunk(completionId, body.model, {}, "stop"))
+            encodeSse(
+              formatChatStreamChunk(completionId, body.model, {}, "stop", {
+                sessionMode: session.mode,
+                sessionId: responseSessionId,
+                usage: includeUsage ? result.usage : undefined
+              })
+            )
           );
         }
 
@@ -293,19 +352,29 @@ server.post("/v1/chat/completions", async (request, reply) => {
       });
       reply.raw.write(
         encodeSse(
-          formatChatStreamChunk(completionId, body.model, {
-            role: "assistant",
-            cloxy: {
-              session_mode: session.mode,
-              ...(responseSessionId ? { session_id: responseSessionId } : {})
+          formatChatStreamChunk(
+            completionId,
+            body.model,
+            { role: "assistant" },
+            null,
+            {
+              sessionMode: session.mode,
+              sessionId: responseSessionId
             }
-          })
+          )
         )
       );
 
       for await (const event of adapter.stream({
         messages,
         cwd: workingDirectory,
+        model: requestedModel,
+        reasoningEffort,
+        maxTurns: body.max_turns,
+        env: requestedEnv,
+        additionalDirectories,
+        codexSearch: body.codex_search,
+        codexFastMode: body.codex_fast_mode,
         codexSandbox,
         claudePermissionMode,
         geminiApprovalMode,
@@ -329,7 +398,13 @@ server.post("/v1/chat/completions", async (request, reply) => {
 
         if (event.type === "done") {
           reply.raw.write(
-            encodeSse(formatChatStreamChunk(completionId, body.model, {}, "stop"))
+            encodeSse(
+              formatChatStreamChunk(completionId, body.model, {}, "stop", {
+                sessionMode: session.mode,
+                sessionId: responseSessionId,
+                usage: includeUsage ? event.usage : undefined
+              })
+            )
           );
           reply.raw.write("data: [DONE]\n\n");
         }
@@ -354,6 +429,13 @@ server.post("/v1/chat/completions", async (request, reply) => {
   const result = await adapter.complete({
     messages: buildBackendMessages(messages, toolConfig, adapter.backend),
     cwd: workingDirectory,
+    model: requestedModel,
+    reasoningEffort,
+    maxTurns: body.max_turns,
+    env: requestedEnv,
+    additionalDirectories,
+    codexSearch: body.codex_search,
+    codexFastMode: body.codex_fast_mode,
     codexSandbox,
     claudePermissionMode,
     geminiApprovalMode,
@@ -374,25 +456,28 @@ server.post("/v1/chat/completions", async (request, reply) => {
     if (toolResult.type === "tool_calls") {
       return formatChatToolCompletion(body.model, toolResult.toolCalls, {
         sessionMode: session.mode,
-        sessionId: result.sessionId
+        sessionId: result.sessionId,
+        usage: result.usage
       });
     }
 
     return formatChatCompletion(body.model, toolResult.content, {
       sessionMode: session.mode,
-      sessionId: result.sessionId
+      sessionId: result.sessionId,
+      usage: result.usage
     });
   }
 
   return formatChatCompletion(body.model, result.text, {
     sessionMode: session.mode,
-    sessionId: result.sessionId
+    sessionId: result.sessionId,
+    usage: result.usage
   });
 });
 
 server.post("/v1/responses", async (request, reply) => {
   const body = responsesSchema.parse(request.body);
-  const backend = resolveBackend(body.model, config.defaultBackend);
+  const backend = resolveBackend(body.model, config.defaultBackend, body.backend);
   const adapter = adapters[backend];
   const requestWorkspaceRoot = getRequestedWorkspaceRoot(body);
   const workingDirectory = resolveWorkingDirectory(
@@ -400,10 +485,18 @@ server.post("/v1/responses", async (request, reply) => {
     mergeAllowedRoots(config.allowedRoots, requestWorkspaceRoot)
   );
   const session = parseSessionHeaders(request.headers);
+  const codexSelection = resolveRequestedCodexModelSelection(request.headers);
   const toolConfig = normalizeTools(body.tools, body.tool_choice);
   const codexSandbox = resolveRequestedCodexSandbox(body, config.codexSandbox);
   const claudePermissionMode = resolveRequestedClaudePermissionMode(body, config.claudePermissionMode);
   const geminiApprovalMode = resolveRequestedGeminiApprovalMode(body);
+  const requestedModel = resolveRequestedModel(backend, body.model, codexSelection.model);
+  const reasoningEffort = resolveRequestedReasoningEffort(
+    body.reasoning_effort,
+    codexSelection.reasoningEffort
+  );
+  const requestedEnv = resolveRequestedEnv(body);
+  const additionalDirectories = resolveRequestedAdditionalDirectories(body);
   const messages = prependInstructions(
     normalizeResponsesInput(body.input),
     body.instructions
@@ -439,6 +532,13 @@ server.post("/v1/responses", async (request, reply) => {
         const result = await adapter.complete({
           messages: buildBackendMessages(messages, toolConfig, adapter.backend),
           cwd: workingDirectory,
+          model: requestedModel,
+          reasoningEffort,
+          maxTurns: body.max_turns,
+          env: requestedEnv,
+          additionalDirectories,
+          codexSearch: body.codex_search,
+          codexFastMode: body.codex_fast_mode,
           codexSandbox,
           claudePermissionMode,
           geminiApprovalMode,
@@ -501,7 +601,8 @@ server.post("/v1/responses", async (request, reply) => {
                 body.instructions,
                 {
                   sessionMode: session.mode,
-                  sessionId: responseSessionId
+                  sessionId: responseSessionId,
+                  usage: result.usage
                 }
               )
             })
@@ -525,7 +626,8 @@ server.post("/v1/responses", async (request, reply) => {
             type: "response.completed",
             response: formatResponseObject(body.model, toolResult.content, body.instructions, {
               sessionMode: session.mode,
-              sessionId: responseSessionId
+              sessionId: responseSessionId,
+              usage: result.usage
             })
           })
         );
@@ -537,6 +639,13 @@ server.post("/v1/responses", async (request, reply) => {
       for await (const event of adapter.stream({
         messages,
         cwd: workingDirectory,
+        model: requestedModel,
+        reasoningEffort,
+        maxTurns: body.max_turns,
+        env: requestedEnv,
+        additionalDirectories,
+        codexSearch: body.codex_search,
+        codexFastMode: body.codex_fast_mode,
         codexSandbox,
         claudePermissionMode,
         geminiApprovalMode,
@@ -584,7 +693,8 @@ server.post("/v1/responses", async (request, reply) => {
                 body.instructions,
                 {
                   sessionMode: session.mode,
-                  sessionId: responseSessionId
+                  sessionId: responseSessionId,
+                  usage: event.usage
                 }
               )
             })
@@ -613,6 +723,13 @@ server.post("/v1/responses", async (request, reply) => {
   const result = await adapter.complete({
     messages: buildBackendMessages(messages, toolConfig, adapter.backend),
     cwd: workingDirectory,
+    model: requestedModel,
+    reasoningEffort,
+    maxTurns: body.max_turns,
+    env: requestedEnv,
+    additionalDirectories,
+    codexSearch: body.codex_search,
+    codexFastMode: body.codex_fast_mode,
     codexSandbox,
     claudePermissionMode,
     geminiApprovalMode,
@@ -633,19 +750,22 @@ server.post("/v1/responses", async (request, reply) => {
     if (toolResult.type === "tool_calls") {
       return formatResponseToolObject(body.model, toolResult.toolCalls, body.instructions, {
         sessionMode: session.mode,
-        sessionId: result.sessionId
+        sessionId: result.sessionId,
+        usage: result.usage
       });
     }
 
     return formatResponseObject(body.model, toolResult.content, body.instructions, {
       sessionMode: session.mode,
-      sessionId: result.sessionId
+      sessionId: result.sessionId,
+      usage: result.usage
     });
   }
 
   return formatResponseObject(body.model, result.text, body.instructions, {
     sessionMode: session.mode,
-    sessionId: result.sessionId
+    sessionId: result.sessionId,
+    usage: result.usage
   });
 });
 
@@ -702,7 +822,15 @@ function listModels(adapters: Record<BackendName, BackendAdapter>): Array<Record
   ];
 }
 
-function resolveBackend(input: string, fallback: BackendName): BackendName {
+function resolveBackend(
+  input: string,
+  fallback: BackendName,
+  explicit?: BackendName
+): BackendName {
+  if (explicit) {
+    return explicit;
+  }
+
   const model = toModelAlias(input);
   if (model.includes("claude")) {
     return "claude";
@@ -739,10 +867,6 @@ function parseSessionHeaders(
     );
   }
 
-  if (rawSessionId && !isUuid(rawSessionId)) {
-    throw new CloxyHttpError("X-Cloxy-Session-Id must be a valid UUID.", 400);
-  }
-
   if (rawMode === "stateless" && rawSessionId) {
     throw new CloxyHttpError(
       "X-Cloxy-Session-Id cannot be combined with X-Cloxy-Session-Mode: stateless.",
@@ -750,10 +874,118 @@ function parseSessionHeaders(
     );
   }
 
+  if (rawSessionId !== undefined && !rawSessionId.trim()) {
+    throw new CloxyHttpError("X-Cloxy-Session-Id cannot be empty.", 400);
+  }
+
   return {
     mode: rawMode === "persist" || rawSessionId ? "persist" : "stateless",
-    sessionId: rawSessionId
+    sessionId: rawSessionId?.trim()
   };
+}
+
+function resolveRequestedCodexModelSelection(
+  headers: Record<string, string | string[] | undefined>
+): CodexModelSelection {
+  const model = getHeaderValue(headers["x-cloxy-codex-model"])?.trim();
+  const reasoningEffortRaw = getHeaderValue(
+    headers["x-cloxy-codex-reasoning-effort"]
+  )?.trim();
+  const reasoningEffort = reasoningEffortRaw?.toLowerCase();
+
+  if (
+    reasoningEffort &&
+    reasoningEffort !== "low" &&
+    reasoningEffort !== "medium" &&
+    reasoningEffort !== "high" &&
+    reasoningEffort !== "xhigh"
+  ) {
+    throw new CloxyHttpError(
+      "X-Cloxy-Codex-Reasoning-Effort must be one of low, medium, high, xhigh.",
+      400
+    );
+  }
+
+  return {
+    ...(model ? { model } : {}),
+    ...(reasoningEffort ? { reasoningEffort } : {})
+  };
+}
+
+function resolveRequestedModel(
+  backend: BackendName,
+  requestModel: string,
+  codexOverride?: string
+): string | undefined {
+  if (backend === "codex" && codexOverride?.trim()) {
+    return normalizeRequestedModel(codexOverride, backend);
+  }
+
+  return normalizeRequestedModel(requestModel, backend);
+}
+
+function resolveRequestedReasoningEffort(
+  inlineValue?: string,
+  headerValue?: string
+): string | undefined {
+  const clean = (headerValue || inlineValue)?.trim().toLowerCase();
+  if (!clean) {
+    return undefined;
+  }
+
+  if (clean !== "low" && clean !== "medium" && clean !== "high" && clean !== "xhigh") {
+    throw new CloxyHttpError(
+      "reasoning_effort must be one of low, medium, high, xhigh.",
+      400
+    );
+  }
+
+  return clean;
+}
+
+function resolveRequestedEnv(body: {
+  env?: Record<string, string>;
+  workspace?: {
+    env?: Record<string, string>;
+  };
+}): Record<string, string> | undefined {
+  const merged = {
+    ...(body.workspace?.env || {}),
+    ...(body.env || {})
+  };
+  return Object.keys(merged).length > 0 ? merged : undefined;
+}
+
+function resolveRequestedAdditionalDirectories(body: {
+  additional_directories?: string[];
+  workspace?: {
+    additional_directories?: string[];
+  };
+}): string[] | undefined {
+  const merged = [
+    ...(body.workspace?.additional_directories || []),
+    ...(body.additional_directories || [])
+  ]
+    .map((value) => value.trim())
+    .filter(Boolean);
+  return merged.length > 0 ? [...new Set(merged)] : undefined;
+}
+
+function normalizeRequestedModel(
+  model: string | undefined,
+  backend: BackendName
+): string | undefined {
+  const clean = model?.trim();
+  if (!clean) {
+    return undefined;
+  }
+
+  const normalized = clean.toLowerCase();
+  if (normalized === backend || normalized === `cloxy-${backend}`) {
+    return undefined;
+  }
+
+  return clean;
 }
 
 function applySessionHeaders(
@@ -791,12 +1023,6 @@ function buildUsagePolicyHeaders(adapter: BackendAdapter): Record<string, string
   return {
     "X-Cloxy-Usage-Policy": adapter.usagePolicy
   };
-}
-
-function isUuid(value: string): boolean {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
-    value
-  );
 }
 
 function buildBackendMessages(

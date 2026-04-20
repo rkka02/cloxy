@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
+import type { CompletionUsage } from "./adapters/types";
 import { CloxyHttpError, PayloadTooLargeError, UnsupportedFeatureError } from "./errors";
 
 export type ChatRole = "system" | "user" | "assistant" | "tool";
@@ -338,6 +339,7 @@ export function formatChatCompletion(
   options?: {
     sessionMode?: "stateless" | "persist";
     sessionId?: string;
+    usage?: CompletionUsage;
   }
 ): Record<string, unknown> {
   return {
@@ -345,14 +347,8 @@ export function formatChatCompletion(
     object: "chat.completion",
     created: nowSeconds(),
     model: requestModel,
-    ...(options?.sessionMode
-      ? {
-          cloxy: {
-            session_mode: options.sessionMode,
-            ...(options.sessionId ? { session_id: options.sessionId } : {})
-          }
-        }
-      : {}),
+    ...(buildCloxyEnvelope(options) ? { cloxy: buildCloxyEnvelope(options) } : {}),
+    ...(options?.usage ? { usage: buildUsageObject(options.usage) } : {}),
     choices: [
       {
         index: 0,
@@ -372,6 +368,7 @@ export function formatChatToolCompletion(
   options?: {
     sessionMode?: "stateless" | "persist";
     sessionId?: string;
+    usage?: CompletionUsage;
   }
 ): Record<string, unknown> {
   return {
@@ -379,14 +376,8 @@ export function formatChatToolCompletion(
     object: "chat.completion",
     created: nowSeconds(),
     model: requestModel,
-    ...(options?.sessionMode
-      ? {
-          cloxy: {
-            session_mode: options.sessionMode,
-            ...(options.sessionId ? { session_id: options.sessionId } : {})
-          }
-        }
-      : {}),
+    ...(buildCloxyEnvelope(options) ? { cloxy: buildCloxyEnvelope(options) } : {}),
+    ...(options?.usage ? { usage: buildUsageObject(options.usage) } : {}),
     choices: [
       {
         index: 0,
@@ -405,13 +396,20 @@ export function formatChatStreamChunk(
   id: string,
   model: string,
   delta: Record<string, unknown>,
-  finishReason: string | null = null
+  finishReason: string | null = null,
+  options?: {
+    sessionMode?: "stateless" | "persist";
+    sessionId?: string;
+    usage?: CompletionUsage;
+  }
 ): Record<string, unknown> {
   return {
     id,
     object: "chat.completion.chunk",
     created: nowSeconds(),
     model,
+    ...(buildCloxyEnvelope(options) ? { cloxy: buildCloxyEnvelope(options) } : {}),
+    ...(options?.usage ? { usage: buildUsageObject(options.usage) } : {}),
     choices: [
       {
         index: 0,
@@ -429,6 +427,7 @@ export function formatResponseToolObject(
   options?: {
     sessionMode?: "stateless" | "persist";
     sessionId?: string;
+    usage?: CompletionUsage;
   }
 ): Record<string, unknown> {
   return buildResponseObject({
@@ -440,6 +439,7 @@ export function formatResponseToolObject(
     status: "completed",
     sessionMode: options?.sessionMode,
     sessionId: options?.sessionId,
+    usage: options?.usage,
     toolCalls
   });
 }
@@ -451,6 +451,7 @@ export function formatResponseObject(
   options?: {
     sessionMode?: "stateless" | "persist";
     sessionId?: string;
+    usage?: CompletionUsage;
   }
 ): Record<string, unknown> {
   return buildResponseObject({
@@ -461,7 +462,8 @@ export function formatResponseObject(
     instructions,
     status: "completed",
     sessionMode: options?.sessionMode,
-    sessionId: options?.sessionId
+    sessionId: options?.sessionId,
+    usage: options?.usage
   });
 }
 
@@ -495,6 +497,7 @@ export function formatResponseCompleted(
   options?: {
     sessionMode?: "stateless" | "persist";
     sessionId?: string;
+    usage?: CompletionUsage;
   }
 ): Record<string, unknown> {
   return buildResponseObject({
@@ -505,7 +508,8 @@ export function formatResponseCompleted(
     instructions,
     status: "completed",
     sessionMode: options?.sessionMode,
-    sessionId: options?.sessionId
+    sessionId: options?.sessionId,
+    usage: options?.usage
   });
 }
 
@@ -518,6 +522,7 @@ function buildResponseObject(input: {
   status: "in_progress" | "completed";
   sessionMode?: "stateless" | "persist";
   sessionId?: string;
+  usage?: CompletionUsage;
   toolCalls?: PlannedToolCall[];
 }): Record<string, unknown> {
   const output =
@@ -574,12 +579,56 @@ function buildResponseObject(input: {
         type: "text"
       }
     },
-    usage: null,
+    usage: input.usage ? buildUsageObject(input.usage) : null,
     metadata: {
       ...(input.sessionMode ? { cloxy_session_mode: input.sessionMode } : {}),
       ...(input.sessionId ? { cloxy_session_id: input.sessionId } : {}),
+      ...(input.usage ? { cloxy_usage: buildRawUsageMetadata(input.usage) } : {}),
       ...(input.toolCalls?.length ? { cloxy_tool_call_count: input.toolCalls.length } : {})
     }
+  };
+}
+
+function buildCloxyEnvelope(options?: {
+  sessionMode?: "stateless" | "persist";
+  sessionId?: string;
+  usage?: CompletionUsage;
+}): Record<string, unknown> | null {
+  if (!options?.sessionMode && !options?.sessionId && !options?.usage) {
+    return null;
+  }
+
+  return {
+    ...(options?.sessionMode ? { session_mode: options.sessionMode } : {}),
+    ...(options?.sessionId ? { session_id: options.sessionId } : {}),
+    ...(options?.usage ? { usage: buildRawUsageMetadata(options.usage) } : {})
+  };
+}
+
+function buildUsageObject(usage: CompletionUsage): Record<string, unknown> {
+  return {
+    input_tokens: usage.inputTokens,
+    output_tokens: usage.outputTokens,
+    total_tokens:
+      usage.inputTokens +
+      usage.cacheCreationInputTokens +
+      usage.cacheReadInputTokens +
+      usage.outputTokens,
+    cache_creation_input_tokens: usage.cacheCreationInputTokens,
+    cache_read_input_tokens: usage.cacheReadInputTokens,
+    total_context_tokens: usage.totalContextTokens,
+    context_window: usage.contextWindow ?? null
+  };
+}
+
+function buildRawUsageMetadata(usage: CompletionUsage): Record<string, unknown> {
+  return {
+    input_tokens: usage.inputTokens,
+    cache_creation_input_tokens: usage.cacheCreationInputTokens,
+    cache_read_input_tokens: usage.cacheReadInputTokens,
+    output_tokens: usage.outputTokens,
+    total_context_tokens: usage.totalContextTokens,
+    context_window: usage.contextWindow ?? null
   };
 }
 

@@ -98,10 +98,12 @@ async function runGeminiProcess(
     includeImagePlaceholders: false
   });
   const approvalMode = params.geminiApprovalMode ?? "plan";
+  const modelArgs = buildGeminiModelArgs(normalizeRequestedModel(params.model, "gemini"));
 
   const args = [
     "--approval-mode",
     approvalMode,
+    ...modelArgs,
     "-o",
     outputFormat,
     "-p",
@@ -111,7 +113,11 @@ async function runGeminiProcess(
 
   const child = spawnCli(config.geminiBinary, args, {
     cwd: params.cwd,
-    stdio: ["ignore", "pipe", "pipe"]
+    stdio: ["ignore", "pipe", "pipe"],
+    env: {
+      ...process.env,
+      ...(params.env || {})
+    }
   });
 
   let stdout = "";
@@ -230,6 +236,34 @@ function extractJsonObject(output: string): string | undefined {
   }
 
   return output.slice(firstBrace, lastBrace + 1);
+}
+
+function buildGeminiModelArgs(model: string | undefined): string[] {
+  const cleanModel = model?.trim();
+  if (!cleanModel) {
+    return [];
+  }
+
+  const normalized = cleanModel.toLowerCase();
+  if (normalized === "gemini" || normalized === "cloxy-gemini") {
+    return [];
+  }
+
+  return ["-m", cleanModel];
+}
+
+function normalizeRequestedModel(model: string | undefined, backend: string): string | undefined {
+  const clean = model?.trim();
+  if (!clean) {
+    return undefined;
+  }
+
+  const normalized = clean.toLowerCase();
+  if (normalized === backend || normalized === `cloxy-${backend}`) {
+    return undefined;
+  }
+
+  return clean;
 }
 
 function normalizeGeminiError(error: GeminiJsonResult["error"]): Error {
