@@ -5,7 +5,7 @@ import type { CloxyConfig } from "../config";
 import { renderTranscript } from "../openai";
 import type {
   BackendAdapter,
-  CodexReasoningEffort,
+  CompletionUsage,
   CodexSandboxMode,
   CompletionParams,
   CompletionResult,
@@ -16,6 +16,7 @@ import { spawnCli, waitForExit } from "./process";
 interface CodexParsedOutput {
   text?: string;
   sessionId?: string;
+  usage?: CompletionUsage;
 }
 
 export class CodexAdapter implements BackendAdapter {
@@ -40,7 +41,8 @@ export class CodexAdapter implements BackendAdapter {
     return {
       backend: this.backend,
       text: output.text.trim(),
-      sessionId: output.sessionId
+      sessionId: output.sessionId,
+      usage: output.usage
     };
   }
 
@@ -62,7 +64,8 @@ export class CodexAdapter implements BackendAdapter {
     }
 
     yield {
-      type: "done"
+      type: "done",
+      usage: output.usage
     };
   }
 }
@@ -73,35 +76,15 @@ async function runCodexProcess(
 ): Promise<CodexParsedOutput> {
   const imageTempDir = await createImageTempDir(params);
   const sandbox = params.codexSandbox ?? (config.codexSandbox as CodexSandboxMode);
-  const resumeModeArgs = buildResumeModeArgs(sandbox);
-  const reasoningArgs = buildReasoningArgs(params.codexReasoningEffort);
-  const args = params.sessionId
-    ? [
-        "exec",
-        "resume",
-        "--json",
-        ...(params.model ? ["--model", params.model] : []),
-        ...reasoningArgs,
-        "--skip-git-repo-check",
-        ...resumeModeArgs,
-        ...imageTempDir.args,
-        params.sessionId,
-        "-"
-      ]
-    : [
-        "exec",
-        "--skip-git-repo-check",
-        "--json",
-        ...(params.model ? ["--model", params.model] : []),
-        ...reasoningArgs,
-        ...buildExecModeArgs(sandbox, params.persistSession),
-        ...imageTempDir.args,
-        "-"
-      ];
+  const args = buildCodexArgs(params, sandbox, imageTempDir.args);
 
   const child = spawnCli(config.codexBinary, args, {
     cwd: params.cwd,
-    stdio: ["pipe", "pipe", "pipe"]
+    stdio: ["pipe", "pipe", "pipe"],
+    env: {
+      ...process.env,
+      ...(params.env || {})
+    }
   });
 
   let stdout = "";
@@ -170,12 +153,18 @@ function parseCodexJsonl(stdout: string): CodexParsedOutput {
 
   let text: string | undefined;
   let sessionId: string | undefined;
+  let usage: CompletionUsage | undefined;
 
   for (const line of lines) {
     const parsed = JSON.parse(line) as Record<string, unknown>;
 
     if (parsed.type === "thread.started" && typeof parsed.thread_id === "string") {
       sessionId = parsed.thread_id;
+      continue;
+    }
+
+    if (parsed.type === "turn.completed") {
+      usage = extractCodexUsage(parsed) ?? usage;
       continue;
     }
 
@@ -187,7 +176,7 @@ function parseCodexJsonl(stdout: string): CodexParsedOutput {
     }
   }
 
-  return { text, sessionId };
+  return { text, sessionId, usage };
 }
 
 function buildResumeModeArgs(codexSandbox: string): string[] {
@@ -202,14 +191,46 @@ function buildResumeModeArgs(codexSandbox: string): string[] {
   return [];
 }
 
-function buildReasoningArgs(
-  reasoningEffort: CodexReasoningEffort | undefined
+export function buildCodexArgs(
+  params: CompletionParams,
+  sandbox: CodexSandboxMode,
+  imageArgs: string[] = []
 ): string[] {
-  if (!reasoningEffort) {
-    return [];
+  const searchArgs = params.codexSearch ? ["--search"] : [];
+  const resumeModeArgs = buildResumeModeArgs(sandbox);
+  const modelArgs = buildModelArgs(
+    normalizeRequestedModel(params.model, "codex"),
+    params.reasoningEffort ?? params.codexReasoningEffort
+  );
+  const fastModeArgs = buildFastModeArgs(params.codexFastMode);
+
+  if (params.sessionId) {
+    return [
+      ...searchArgs,
+      "exec",
+      "resume",
+      "--json",
+      "--skip-git-repo-check",
+      ...resumeModeArgs,
+      ...modelArgs,
+      ...fastModeArgs,
+      ...imageArgs,
+      params.sessionId,
+      "-"
+    ];
   }
 
-  return ["-c", `model_reasoning_effort="${reasoningEffort}"`];
+  return [
+    ...searchArgs,
+    "exec",
+    "--skip-git-repo-check",
+    "--json",
+    ...buildExecModeArgs(sandbox, params.persistSession),
+    ...modelArgs,
+    ...fastModeArgs,
+    ...imageArgs,
+    "-"
+  ];
 }
 
 function buildExecModeArgs(
@@ -223,4 +244,68 @@ function buildExecModeArgs(
   }
 
   return ["--sandbox", codexSandbox, ...persistenceArgs];
+}
+
+function buildModelArgs(
+  model: string | undefined,
+  reasoningEffort: string | undefined
+): string[] {
+  const args: string[] = [];
+  const cleanModel = model?.trim();
+  const cleanEffort = reasoningEffort?.trim();
+
+  if (cleanModel) {
+    args.push("--model", cleanModel);
+  }
+
+  if (cleanEffort) {
+    args.push("-c", `model_reasoning_effort="${cleanEffort}"`);
+  }
+
+  return args;
+}
+
+function buildFastModeArgs(fastMode: boolean | null | undefined): string[] {
+  if (fastMode === true) {
+    return ["--enable", "fast_mode"];
+  }
+
+  if (fastMode === false) {
+    return ["--disable", "fast_mode"];
+  }
+
+  return [];
+}
+
+function extractCodexUsage(parsed: Record<string, unknown>): CompletionUsage | undefined {
+  const usage = parsed.usage as Record<string, unknown> | undefined;
+  if (!usage) {
+    return undefined;
+  }
+
+  const inputTokens = typeof usage.input_tokens === "number" ? usage.input_tokens : 0;
+  const outputTokens = typeof usage.output_tokens === "number" ? usage.output_tokens : 0;
+
+  return {
+    inputTokens,
+    cacheCreationInputTokens: 0,
+    cacheReadInputTokens: 0,
+    outputTokens,
+    contextWindow: null,
+    totalContextTokens: inputTokens
+  };
+}
+
+function normalizeRequestedModel(model: string | undefined, backend: string): string | undefined {
+  const clean = model?.trim();
+  if (!clean) {
+    return undefined;
+  }
+
+  const normalized = clean.toLowerCase();
+  if (normalized === backend || normalized === `cloxy-${backend}`) {
+    return undefined;
+  }
+
+  return clean;
 }

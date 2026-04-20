@@ -13,6 +13,7 @@ import type {
   ClaudePermissionMode,
   CompletionParams,
   CompletionResult,
+  CompletionUsage,
   StreamEvent
 } from "./types";
 
@@ -32,9 +33,11 @@ export class ClaudeAdapter implements BackendAdapter {
   async complete(params: CompletionParams): Promise<CompletionResult> {
     let text = "";
     let sessionId = params.sessionId;
+    let usage: CompletionUsage | undefined;
 
     for await (const message of runClaudeQuery(this.config, params, false)) {
       sessionId ??= getClaudeSessionId(message);
+      usage = getClaudeUsage(message) ?? usage;
 
       if (message.type !== "result") {
         continue;
@@ -54,13 +57,15 @@ export class ClaudeAdapter implements BackendAdapter {
     return {
       backend: this.backend,
       text,
-      sessionId
+      sessionId,
+      usage
     };
   }
 
   async *stream(params: CompletionParams): AsyncGenerator<StreamEvent> {
     let emittedDone = false;
     let emittedSession = false;
+    let usage: CompletionUsage | undefined;
 
     for await (const message of runClaudeQuery(this.config, params, true)) {
       const sessionId = getClaudeSessionId(message);
@@ -68,6 +73,8 @@ export class ClaudeAdapter implements BackendAdapter {
         emittedSession = true;
         yield { type: "session", sessionId };
       }
+
+      usage = getClaudeUsage(message) ?? usage;
 
       if (message.type === "stream_event") {
         const text = extractClaudeTextDelta(message);
@@ -83,12 +90,12 @@ export class ClaudeAdapter implements BackendAdapter {
         }
 
         emittedDone = true;
-        yield { type: "done" };
+        yield { type: "done", usage };
       }
     }
 
     if (!emittedDone) {
-      yield { type: "done" };
+      yield { type: "done", usage };
     }
   }
 }
@@ -99,20 +106,25 @@ async function* runClaudeQuery(
   includePartialMessages: boolean
 ): AsyncGenerator<SDKMessage> {
   const permissionMode = params.claudePermissionMode ?? (config.claudePermissionMode as ClaudePermissionMode);
-  const maxTurns = permissionMode === "plan" ? 1 : 8;
+  const maxTurns = params.maxTurns ?? (permissionMode === "plan" ? 1 : 8);
   const session = query({
     prompt: createClaudeInput(params.messages),
     options: {
       cwd: params.cwd,
       includePartialMessages,
       maxTurns,
-      ...(params.model ? { model: params.model } : {}),
+      model: normalizeRequestedModel(params.model, "claude"),
       pathToClaudeCodeExecutable: config.claudeBinary,
       permissionMode: permissionMode as PermissionMode,
       allowDangerouslySkipPermissions: permissionMode === "bypassPermissions",
       persistSession: params.persistSession,
       resume: params.sessionId,
-      systemPrompt: buildClaudeSystemPrompt(params.messages)
+      systemPrompt: buildClaudeSystemPrompt(params.messages),
+      env: {
+        ...process.env,
+        ...(params.env || {})
+      },
+      additionalDirectories: params.additionalDirectories
     }
   });
 
@@ -241,6 +253,40 @@ function getClaudeSessionId(message: SDKMessage): string | undefined {
     : undefined;
 }
 
+function getClaudeUsage(message: SDKMessage): CompletionUsage | undefined {
+  if (message.type !== "result") {
+    return undefined;
+  }
+
+  const usage = "usage" in message ? message.usage : undefined;
+  if (!usage || typeof usage !== "object") {
+    return undefined;
+  }
+
+  const inputTokens = getNumericField(usage, "input_tokens");
+  const cacheCreationInputTokens = getNumericField(usage, "cache_creation_input_tokens");
+  const cacheReadInputTokens = getNumericField(usage, "cache_read_input_tokens");
+  const outputTokens = getNumericField(usage, "output_tokens");
+  const modelUsage =
+    "modelUsage" in message && typeof message.modelUsage === "object" && message.modelUsage
+      ? (message.modelUsage as Record<string, Record<string, unknown>>)
+      : undefined;
+  const firstModel = modelUsage ? Object.keys(modelUsage)[0] : undefined;
+  const contextWindow =
+    firstModel && modelUsage?.[firstModel]
+      ? getNullableNumericField(modelUsage[firstModel], "contextWindow")
+      : null;
+
+  return {
+    inputTokens,
+    cacheCreationInputTokens,
+    cacheReadInputTokens,
+    outputTokens,
+    contextWindow,
+    totalContextTokens: inputTokens + cacheCreationInputTokens + cacheReadInputTokens
+  };
+}
+
 function extractClaudeTextDelta(message: SDKMessage): string | undefined {
   if (message.type !== "stream_event") {
     return undefined;
@@ -257,6 +303,32 @@ function extractClaudeTextDelta(message: SDKMessage): string | undefined {
   }
 
   return delta.text;
+}
+
+function normalizeRequestedModel(model: string | undefined, backend: string): string | undefined {
+  const clean = model?.trim();
+  if (!clean) {
+    return undefined;
+  }
+
+  const normalized = clean.toLowerCase();
+  if (normalized === backend || normalized === `cloxy-${backend}`) {
+    return undefined;
+  }
+
+  return clean;
+}
+
+function getNumericField(value: object, key: string): number {
+  const record = value as Record<string, unknown>;
+  const candidate = record[key];
+  return typeof candidate === "number" ? candidate : 0;
+}
+
+function getNullableNumericField(value: object, key: string): number | null {
+  const record = value as Record<string, unknown>;
+  const candidate = record[key];
+  return typeof candidate === "number" ? candidate : null;
 }
 
 function toClaudeFailureError(message: Extract<SDKMessage, { type: "result" }>): Error {
